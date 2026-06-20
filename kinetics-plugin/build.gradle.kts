@@ -6,6 +6,10 @@ plugins {
 dependencies {
     implementation(project(":kinetics-api"))
     compileOnly("io.papermc.paper:paper-api:1.21.11-R0.1-SNAPSHOT")
+
+    implementation("com.github.stephengold:jolt-jni-Windows64:5.1.0")
+    runtimeOnly("com.github.stephengold:jolt-jni-Windows64:5.1.0:ReleaseSp")
+    runtimeOnly("com.github.stephengold:jolt-jni-Linux64:5.1.0:ReleaseSp")
     testImplementation("org.junit.jupiter:junit-jupiter:5.12.2")
     testRuntimeOnly("io.papermc.paper:paper-api:1.21.11-R0.1-SNAPSHOT")
     testRuntimeOnly("org.junit.platform:junit-platform-launcher:1.12.2")
