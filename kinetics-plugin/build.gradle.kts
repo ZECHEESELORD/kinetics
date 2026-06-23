@@ -6,6 +6,7 @@ plugins {
 dependencies {
     implementation(project(":kinetics-api"))
     compileOnly("io.papermc.paper:paper-api:1.21.11-R0.1-SNAPSHOT")
+    compileOnly("com.github.retrooper:packetevents-spigot:2.13.0")
 
     implementation("com.github.stephengold:jolt-jni-Windows64:5.1.0")
     runtimeOnly("com.github.stephengold:jolt-jni-Windows64:5.1.0:ReleaseSp")
