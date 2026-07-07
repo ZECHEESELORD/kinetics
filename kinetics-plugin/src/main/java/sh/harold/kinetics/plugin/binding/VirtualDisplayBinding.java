@@ -75,7 +75,8 @@ public final class VirtualDisplayBinding implements BodyBinding {
             return;
         }
 
-        Collection<? extends Player> desiredViewers = viewerCache.viewers(state, viewers);
+        Collection<? extends Player> desiredViewers = viewerCache.viewers(
+                renderer.renderAnchor(display, state), renderer.renderBounds(display, state), viewers);
 
         // Sleeping snapshots get a stable sequence: existing viewers receive no redundant pose
         // packet, while publish still discovers and spawns newly eligible viewers.

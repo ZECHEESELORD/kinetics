@@ -25,6 +25,7 @@ import org.bukkit.entity.EntitySnapshot;
 import org.bukkit.entity.ItemDisplay;
 import org.bukkit.entity.Player;
 import org.bukkit.inventory.ItemStack;
+import org.bukkit.util.BoundingBox;
 import org.bukkit.util.Transformation;
 import org.joml.Quaternionf;
 import org.joml.Vector3f;
@@ -61,6 +62,22 @@ public final class VirtualDisplayRenderer {
 
     public long packetsSent() {
         return packetsSent;
+    }
+
+    /** Returns the client entity anchor used for chunk tracking. */
+    public Vec3 renderAnchor(RenderedDisplay display, BodyState state) {
+        requirePrimaryThread();
+        requireLive(display);
+        validate(state, display.modelOriginFromBody);
+        return anchor(state, display.modelOriginFromBody, display.modelTranslation);
+    }
+
+    /** Returns the conservative world bounds of the model rendered for this body snapshot. */
+    public BoundingBox renderBounds(RenderedDisplay display, BodyState state) {
+        requirePrimaryThread();
+        requireLive(display);
+        validate(state, display.modelOriginFromBody);
+        return calculateBounds(display, state);
     }
 
     public RenderedDisplay createBlock(World world, BlockData blockData, BodyState state) {
@@ -172,7 +189,11 @@ public final class VirtualDisplayRenderer {
         if (transformChanged) display.transformRevision++;
         display.lastState = state;
         long pass = ++display.viewerPass;
-        Vec3 position = state.pose().position();
+        BoundingBox bounds = calculateBounds(display, state);
+        Vec3 position = new Vec3(
+                (bounds.getMinX() + bounds.getMaxX()) * 0.5,
+                (bounds.getMinY() + bounds.getMaxY()) * 0.5,
+                (bounds.getMinZ() + bounds.getMaxZ()) * 0.5);
 
         for (Player player : desiredViewers) {
             if (player == null || !player.isOnline() || !player.getWorld().equals(display.world)) {
@@ -445,10 +466,19 @@ public final class VirtualDisplayRenderer {
                 Optional.empty()
         );
         send(player, spawn);
-        send(player, new WrapperPlayServerEntityMetadata(
-                display.entityId,
-                fullMetadata(display, state, lod.intervalTicks())
-        ));
+        try {
+            send(player, new WrapperPlayServerEntityMetadata(
+                    display.entityId,
+                    fullMetadata(display, state, lod.intervalTicks())
+            ));
+        } catch (RuntimeException | Error failure) {
+            try {
+                send(player, new WrapperPlayServerDestroyEntities(display.entityId));
+            } catch (RuntimeException | Error rollbackFailure) {
+                failure.addSuppressed(rollbackFailure);
+            }
+            throw failure;
+        }
     }
 
     private void sendUpdate(
@@ -553,19 +583,67 @@ public final class VirtualDisplayRenderer {
 
     private static Vec3 anchor(BodyState state, Vec3 modelOriginFromBody, Vector3f modelTranslation) {
         Vec3 scale = state.scale();
-        double x = modelOriginFromBody.x() * scale.x();
-        double y = modelOriginFromBody.y() * scale.y();
-        double z = modelOriginFromBody.z() * scale.z();
-        Rotation q = state.pose().rotation();
+        Vec3 scaledOrigin = new Vec3(
+                modelOriginFromBody.x() * scale.x(),
+                modelOriginFromBody.y() * scale.y(),
+                modelOriginFromBody.z() * scale.z());
+        Vec3 translation = new Vec3(modelTranslation.x, modelTranslation.y, modelTranslation.z);
+        return state.pose().position().add(rotate(state.pose().rotation(), scaledOrigin))
+                .subtract(translation);
+    }
 
-        double tx = 2.0 * (q.y() * z - q.z() * y);
-        double ty = 2.0 * (q.z() * x - q.x() * z);
-        double tz = 2.0 * (q.x() * y - q.y() * x);
-        double rx = x + q.w() * tx + q.y() * tz - q.z() * ty;
-        double ry = y + q.w() * ty + q.z() * tx - q.x() * tz;
-        double rz = z + q.w() * tz + q.x() * ty - q.y() * tx;
-        return state.pose().position().add(new Vec3(
-                rx - modelTranslation.x, ry - modelTranslation.y, rz - modelTranslation.z));
+    private static BoundingBox calculateBounds(RenderedDisplay display, BodyState state) {
+        Vec3 entityAnchor = anchor(state, display.modelOriginFromBody, display.modelTranslation);
+        Vec3 translation = new Vec3(
+                display.modelTranslation.x, display.modelTranslation.y, display.modelTranslation.z);
+        Vec3 scale = state.scale();
+        double minimum = display.kind == RenderedDisplay.Kind.BLOCK ? 0.0 : -0.5;
+        double maximum = display.kind == RenderedDisplay.Kind.BLOCK ? 1.0 : 0.5;
+        double minX = Double.POSITIVE_INFINITY;
+        double minY = Double.POSITIVE_INFINITY;
+        double minZ = Double.POSITIVE_INFINITY;
+        double maxX = Double.NEGATIVE_INFINITY;
+        double maxY = Double.NEGATIVE_INFINITY;
+        double maxZ = Double.NEGATIVE_INFINITY;
+        for (int xIndex = 0; xIndex < 2; xIndex++) {
+            double x = xIndex == 0 ? minimum : maximum;
+            for (int yIndex = 0; yIndex < 2; yIndex++) {
+                double y = yIndex == 0 ? minimum : maximum;
+                for (int zIndex = 0; zIndex < 2; zIndex++) {
+                    double z = zIndex == 0 ? minimum : maximum;
+                    Vec3 local = rotate(display.modelRightRotation, new Vec3(x, y, z));
+                    Vec3 scaled = new Vec3(local.x() * scale.x(), local.y() * scale.y(),
+                            local.z() * scale.z());
+                    Vec3 point = entityAnchor.add(translation)
+                            .add(rotate(state.pose().rotation(), scaled));
+                    minX = Math.min(minX, point.x());
+                    minY = Math.min(minY, point.y());
+                    minZ = Math.min(minZ, point.z());
+                    maxX = Math.max(maxX, point.x());
+                    maxY = Math.max(maxY, point.y());
+                    maxZ = Math.max(maxZ, point.z());
+                }
+            }
+        }
+        return new BoundingBox(minX, minY, minZ, maxX, maxY, maxZ);
+    }
+
+    private static Vec3 rotate(Rotation rotation, Vec3 vector) {
+        return rotate(rotation.x(), rotation.y(), rotation.z(), rotation.w(), vector);
+    }
+
+    private static Vec3 rotate(Quaternionf rotation, Vec3 vector) {
+        return rotate(rotation.x, rotation.y, rotation.z, rotation.w, vector);
+    }
+
+    private static Vec3 rotate(double x, double y, double z, double w, Vec3 vector) {
+        double tx = 2.0 * (y * vector.z() - z * vector.y());
+        double ty = 2.0 * (z * vector.x() - x * vector.z());
+        double tz = 2.0 * (x * vector.y() - y * vector.x());
+        return new Vec3(
+                vector.x() + w * tx + y * tz - z * ty,
+                vector.y() + w * ty + z * tx - x * tz,
+                vector.z() + w * tz + x * ty - y * tx);
     }
 
     private static Vector3d packetVector(Vec3 value) {

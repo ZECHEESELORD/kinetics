@@ -10,7 +10,7 @@ import org.bukkit.Bukkit;
 import org.bukkit.Chunk;
 import org.bukkit.World;
 import org.bukkit.entity.Player;
-import sh.harold.kinetics.api.BodyState;
+import org.bukkit.util.BoundingBox;
 import sh.harold.kinetics.api.Vec3;
 
 /** Resolves players once per occupied chunk and Paper tick for one scene. */
@@ -27,36 +27,44 @@ public final class ChunkViewerCache {
 
     /**
      * Returns viewers for every chunk conservatively occupied by the scaled, rotated display.
-     * {@code union} is only used for displays spanning more than one chunk.
+     * {@code union} is used when the model bounds and tracking anchor need multiple chunks.
      */
-    public Collection<? extends Player> viewers(BodyState state, ArrayList<Player> union) {
+    public Collection<? extends Player> viewers(Vec3 anchor, BoundingBox bounds, ArrayList<Player> union) {
         requirePrimaryThread();
-        Objects.requireNonNull(state, "state");
+        Objects.requireNonNull(anchor, "anchor");
+        Objects.requireNonNull(bounds, "bounds");
         Objects.requireNonNull(union, "union");
         refreshTick();
 
-        Vec3 position = state.pose().position();
-        Vec3 scale = state.scale();
-        double radius = 0.5 * Math.sqrt(scale.lengthSquared());
-        int minimumX = block(position.x() - radius) >> 4;
-        int maximumX = block(position.x() + radius) >> 4;
-        int minimumZ = block(position.z() - radius) >> 4;
-        int maximumZ = block(position.z() + radius) >> 4;
-        if (minimumX == maximumX && minimumZ == maximumZ) {
+        int minimumX = block(bounds.getMinX()) >> 4;
+        int maximumX = block(bounds.getMaxX()) >> 4;
+        int minimumZ = block(bounds.getMinZ()) >> 4;
+        int maximumZ = block(bounds.getMaxZ()) >> 4;
+        int anchorX = block(anchor.x()) >> 4;
+        int anchorZ = block(anchor.z()) >> 4;
+        if (minimumX == maximumX && minimumZ == maximumZ
+                && minimumX == anchorX && minimumZ == anchorZ) {
             return viewers(Chunk.getChunkKey(minimumX, minimumZ));
         }
 
         union.clear();
         for (int chunkX = minimumX; chunkX <= maximumX; chunkX++) {
             for (int chunkZ = minimumZ; chunkZ <= maximumZ; chunkZ++) {
-                for (Player player : viewers(Chunk.getChunkKey(chunkX, chunkZ))) {
-                    if (!union.contains(player)) {
-                        union.add(player);
-                    }
-                }
+                addViewers(union, Chunk.getChunkKey(chunkX, chunkZ));
             }
         }
+        if (anchorX < minimumX || anchorX > maximumX || anchorZ < minimumZ || anchorZ > maximumZ) {
+            addViewers(union, Chunk.getChunkKey(anchorX, anchorZ));
+        }
         return union;
+    }
+
+    private void addViewers(ArrayList<Player> union, long chunkKey) {
+        for (Player player : viewers(chunkKey)) {
+            if (!union.contains(player)) {
+                union.add(player);
+            }
+        }
     }
 
     private List<Player> viewers(long chunkKey) {

@@ -111,7 +111,7 @@ public final class ColliderInference {
         } else {
             return new InferredCollider(APPROXIMATE_ITEM, ColliderFidelity.APPROXIMATE);
         }
-        return new InferredCollider(shape, ColliderFidelity.EXACT);
+        return new InferredCollider(shape, ColliderFidelity.APPROXIMATE);
     }
 
     private static PhysicsShape foodShape(String name) {

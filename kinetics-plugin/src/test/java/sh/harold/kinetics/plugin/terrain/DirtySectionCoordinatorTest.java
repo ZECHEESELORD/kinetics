@@ -29,4 +29,22 @@ class DirtySectionCoordinatorTest {
                 coordinator.status("section").orElseThrow()
         );
     }
+
+    @Test
+    void failedActivationCanBeRequeuedWithoutBecomingActive() {
+        DirtySectionCoordinator<String> coordinator = new DirtySectionCoordinator<>();
+
+        long revision = coordinator.markDirty("section", 0);
+        assertEquals(revision, coordinator.pollDirty().orElseThrow().revision());
+        assertTrue(coordinator.markCaptured("section", revision));
+        assertTrue(coordinator.markBuilt("section", revision));
+
+        long retry = coordinator.markDirty("section", 1);
+        assertEquals(
+                new DirtySectionCoordinator.Status(retry, DirtySectionCoordinator.Stage.DIRTY),
+                coordinator.status("section").orElseThrow()
+        );
+        assertEquals(retry, coordinator.pollDirty().orElseThrow().revision());
+        assertFalse(coordinator.markActive("section", revision));
+    }
 }

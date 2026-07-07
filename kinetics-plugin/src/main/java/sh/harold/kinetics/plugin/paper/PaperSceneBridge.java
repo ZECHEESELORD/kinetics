@@ -63,11 +63,12 @@ public final class PaperSceneBridge implements SceneBridge {
         this.closedCallback = Objects.requireNonNull(closedCallback, "closedCallback");
         this.terrain = new PaperTerrainRuntime(plugin, spec, new PaperTerrainRuntime.ActivationSink() {
             @Override
-            public void replaceSection(long sectionKey, PhysicsShape shape, Pose worldPose) {
+            public CompletionStage<Void> replaceSection(long sectionKey, PhysicsShape shape, Pose worldPose) {
                 JoltScene attached = PaperSceneBridge.this.scene;
-                if (attached != null && !attached.closed()) {
-                    attached.replaceTerrainSection(sectionKey, shape, worldPose);
+                if (attached == null || attached.closed()) {
+                    return CompletableFuture.failedFuture(new IllegalStateException("Scene is not available"));
                 }
+                return attached.replaceTerrainSection(sectionKey, shape, worldPose);
             }
 
             @Override

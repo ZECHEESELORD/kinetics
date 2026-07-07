@@ -86,8 +86,12 @@ public final class MobBinding implements BodyBinding {
         }
         if (status == Status.LIVE) {
             requireUniformScale(state.scale());
-            applyPose(state);
-            restore();
+            restoreScale();
+            try {
+                teleport(state, centreAboveFeet);
+            } finally {
+                restore();
+            }
             status = Status.RELEASED;
         }
         return CompletableFuture.completedFuture(Optional.of(mob));
@@ -109,9 +113,16 @@ public final class MobBinding implements BodyBinding {
             return;
         }
         if (lastState != null && mob.isValid()) {
-            applyPose(lastState);
+            requireUniformScale(lastState.scale());
+            restoreScale();
+            try {
+                teleport(lastState, centreAboveFeet);
+            } finally {
+                restore();
+            }
+        } else {
+            restore();
         }
-        restore();
         status = Status.RELEASED;
     }
 
@@ -130,6 +141,10 @@ public final class MobBinding implements BodyBinding {
             appliedScale = scale;
         }
 
+        teleport(state, centreAboveFeet * scale);
+    }
+
+    private void teleport(BodyState state, double feetOffset) {
         Rotation rotation = state.pose().rotation();
         double yawRadians = Math.atan2(
                 2.0 * (rotation.w() * rotation.y() + rotation.x() * rotation.z()),
@@ -138,7 +153,7 @@ public final class MobBinding implements BodyBinding {
         Location location = new Location(
                 world,
                 state.pose().position().x(),
-                state.pose().position().y() - centreAboveFeet * scale,
+                state.pose().position().y() - feetOffset,
                 state.pose().position().z(),
                 (float) -Math.toDegrees(yawRadians),
                 0.0f
@@ -147,13 +162,18 @@ public final class MobBinding implements BodyBinding {
         mob.setVelocity(new Vector());
     }
 
+    private void restoreScale() {
+        if (scaleAttribute != null) {
+            scaleAttribute.setBaseValue(originalScaleBase);
+            appliedScale = 1.0;
+        }
+    }
+
     private void restore() {
         if (!mob.isValid()) {
             return;
         }
-        if (scaleAttribute != null) {
-            scaleAttribute.setBaseValue(originalScaleBase);
-        }
+        restoreScale();
         mob.setAI(originalAi);
         mob.setAware(originalAware);
         mob.setGravity(originalGravity);

@@ -297,17 +297,28 @@ public final class JoltScene implements PhysicsScene {
 
     public void markSkippedTick() { skipped++; }
 
-    public void replaceTerrainSection(long key, PhysicsShape shape, Pose pose) {
-        enqueue(() -> {
-            Integer replacement = null;
-            if (shape != null) {
-                ShapeFactory.CachedShape cached = shapes.acquire(shape, Vec3.ONE, Vec3.ZERO);
-                replacement = createStatic(cached, pose);
-            }
-            Integer old = terrain.remove(key);
-            if (old != null) { bodies.removeBody(old); bodies.destroyBody(old); }
-            if (replacement != null) terrain.put(key, replacement);
-        });
+    public CompletionStage<Void> replaceTerrainSection(long key, PhysicsShape shape, Pose pose) {
+        CompletableFuture<Void> future = new CompletableFuture<>();
+        try {
+            enqueue(() -> {
+                try {
+                    Integer replacement = null;
+                    if (shape != null) {
+                        ShapeFactory.CachedShape cached = shapes.acquire(shape, Vec3.ONE, Vec3.ZERO);
+                        replacement = createStatic(cached, pose);
+                    }
+                    Integer old = terrain.remove(key);
+                    if (old != null) { bodies.removeBody(old); bodies.destroyBody(old); }
+                    if (replacement != null) terrain.put(key, replacement);
+                    complete(future, null, null);
+                } catch (Throwable failure) {
+                    complete(future, null, failure);
+                }
+            });
+        } catch (Throwable failure) {
+            complete(future, null, failure);
+        }
+        return future;
     }
 
     public void quarantine(BoundingBox worldBounds, boolean quarantined) {

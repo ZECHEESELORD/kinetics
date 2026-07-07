@@ -1,5 +1,6 @@
 package sh.harold.kinetics.plugin.terrain;
 
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.BitSet;
 import java.util.Collection;
@@ -36,6 +37,7 @@ import sh.harold.kinetics.api.Vec3;
  */
 public final class PaperTerrainRuntime implements AutoCloseable {
     private static final double EPSILON = 1.0e-7;
+    private static final int MAX_CHUNK_LOADS = 8;
 
     private final JavaPlugin plugin;
     private final SceneSpec spec;
@@ -50,9 +52,14 @@ public final class PaperTerrainRuntime implements AutoCloseable {
     private final CompletableFuture<Void> ready = new CompletableFuture<>();
     private final AtomicBoolean started = new AtomicBoolean();
     private final AtomicInteger buildsInFlight = new AtomicInteger();
+    private final AtomicInteger activationsInFlight = new AtomicInteger();
+    private final ArrayDeque<Long> pendingChunkLoads = new ArrayDeque<>();
 
     private volatile CaptureCursor capture;
     private volatile boolean closed;
+    private int chunkLoadsInFlight;
+    private Throwable chunkLoadFailure;
+    private boolean pumpingChunkLoads;
 
     public PaperTerrainRuntime(JavaPlugin plugin, SceneSpec spec, ActivationSink sink) {
         this.plugin = Objects.requireNonNull(plugin, "plugin");
@@ -126,7 +133,8 @@ public final class PaperTerrainRuntime implements AutoCloseable {
     }
 
     public int dirtySections() {
-        return revisions.pendingCount() + buildsInFlight.get() + (capture == null ? 0 : 1);
+        return revisions.pendingCount() + buildsInFlight.get() + activationsInFlight.get()
+                + (capture == null ? 0 : 1);
     }
 
     public CompletionStage<Void> ready() {
@@ -139,16 +147,12 @@ public final class PaperTerrainRuntime implements AutoCloseable {
             return;
         }
         closed = true;
+        pendingChunkLoads.clear();
         builder.shutdownNow();
         if (!ready.isDone()) {
             ready.completeExceptionally(new IllegalStateException("Terrain runtime closed"));
         }
-        Runnable release = () -> {
-            for (Chunk chunk : ticketedChunks.values()) {
-                chunk.removePluginChunkTicket(plugin);
-            }
-            ticketedChunks.clear();
-        };
+        Runnable release = this::releaseTickets;
         if (Bukkit.isPrimaryThread()) {
             release.run();
         } else if (plugin.isEnabled()) {
@@ -164,40 +168,84 @@ public final class PaperTerrainRuntime implements AutoCloseable {
         for (SectionKey section : sections.values()) {
             chunks.add(Chunk.getChunkKey(section.chunkX, section.chunkZ));
         }
-        CompletableFuture<?>[] loads = chunks.stream().map(key -> {
-            int chunkX = (int) key.longValue();
-            int chunkZ = (int) (key >> 32);
-            return loadAndTicket(chunkX, chunkZ);
-        }).toArray(CompletableFuture[]::new);
-        CompletableFuture.allOf(loads).whenComplete((ignored, failure) -> completeOnMain(() -> {
-            if (closed) {
-                return;
+        pendingChunkLoads.addAll(chunks);
+        pumpChunkLoads();
+    }
+
+    private void pumpChunkLoads() {
+        if (pumpingChunkLoads) {
+            return;
+        }
+        pumpingChunkLoads = true;
+        try {
+            while (!closed && chunkLoadFailure == null && chunkLoadsInFlight < MAX_CHUNK_LOADS
+                    && !pendingChunkLoads.isEmpty()) {
+                long key = pendingChunkLoads.removeFirst();
+                int chunkX = (int) key;
+                int chunkZ = (int) (key >> 32);
+                chunkLoadsInFlight++;
+                loadAndTicket(chunkX, chunkZ).whenComplete((chunk, failure) -> {
+                    chunkLoadsInFlight--;
+                    if (closed) {
+                        return;
+                    }
+                    if (failure != null) {
+                        if (chunkLoadFailure == null) {
+                            chunkLoadFailure = failure;
+                            pendingChunkLoads.clear();
+                            releaseTickets();
+                            ready.completeExceptionally(failure);
+                        }
+                        return;
+                    }
+                    if (pendingChunkLoads.isEmpty() && chunkLoadsInFlight == 0) {
+                        beginInitialBuilds();
+                    } else {
+                        pumpChunkLoads();
+                    }
+                });
             }
-            if (failure != null) {
-                ready.completeExceptionally(failure);
-                return;
-            }
-            for (SectionKey section : sections.values()) {
-                initialSections.add(section.packed());
-                markDirty(section, 0);
-            }
-        }));
+        } finally {
+            pumpingChunkLoads = false;
+        }
+    }
+
+    private void beginInitialBuilds() {
+        for (SectionKey section : sections.values()) {
+            initialSections.add(section.packed());
+            markDirty(section, 0);
+        }
     }
 
     private CompletableFuture<Chunk> loadAndTicket(int chunkX, int chunkZ) {
         CompletableFuture<Chunk> result = new CompletableFuture<>();
-        world.getChunkAtAsync(chunkX, chunkZ, true).whenComplete((chunk, failure) ->
-                completeOnMain(() -> {
-                    if (failure != null) {
-                        result.completeExceptionally(failure);
-                    } else if (closed) {
-                        result.completeExceptionally(new IllegalStateException("Terrain runtime closed"));
-                    } else {
-                        chunk.addPluginChunkTicket(plugin);
-                        ticketedChunks.put(Chunk.getChunkKey(chunkX, chunkZ), chunk);
-                        result.complete(chunk);
-                    }
-                }));
+        try {
+            world.getChunkAtAsync(chunkX, chunkZ, true).whenComplete((chunk, failure) -> {
+                try {
+                    completeOnMain(() -> {
+                        try {
+                            if (failure != null) {
+                                result.completeExceptionally(failure);
+                            } else if (closed || chunkLoadFailure != null) {
+                                result.completeExceptionally(closed
+                                        ? new IllegalStateException("Terrain runtime closed")
+                                        : chunkLoadFailure);
+                            } else {
+                                chunk.addPluginChunkTicket(plugin);
+                                ticketedChunks.put(Chunk.getChunkKey(chunkX, chunkZ), chunk);
+                                result.complete(chunk);
+                            }
+                        } catch (Throwable callbackFailure) {
+                            result.completeExceptionally(callbackFailure);
+                        }
+                    });
+                } catch (Throwable callbackFailure) {
+                    result.completeExceptionally(callbackFailure);
+                }
+            });
+        } catch (Throwable failure) {
+            result.completeExceptionally(failure);
+        }
         return result;
     }
 
@@ -206,12 +254,30 @@ public final class PaperTerrainRuntime implements AutoCloseable {
             return;
         }
         BoundingBox halo = changed.clone().expand(1.0);
-        for (SectionKey section : sections.values()) {
-            BoundingBox bounds = section.bounds(sceneBounds);
-            if (!bounds.overlaps(halo)) {
-                continue;
+        double minX = Math.max(sceneBounds.getMinX(), halo.getMinX());
+        double minY = Math.max(sceneBounds.getMinY(), halo.getMinY());
+        double minZ = Math.max(sceneBounds.getMinZ(), halo.getMinZ());
+        double maxX = Math.min(sceneBounds.getMaxX(), halo.getMaxX());
+        double maxY = Math.min(sceneBounds.getMaxY(), halo.getMaxY());
+        double maxZ = Math.min(sceneBounds.getMaxZ(), halo.getMaxZ());
+        if (minX >= maxX || minY >= maxY || minZ >= maxZ) {
+            return;
+        }
+        int minimumChunkX = floorToInt(minX) >> 4;
+        int minimumSectionY = floorToInt(minY) >> 4;
+        int minimumChunkZ = floorToInt(minZ) >> 4;
+        int maximumChunkX = (ceilToInt(maxX) - 1) >> 4;
+        int maximumSectionY = (ceilToInt(maxY) - 1) >> 4;
+        int maximumChunkZ = (ceilToInt(maxZ) - 1) >> 4;
+        for (int sectionY = minimumSectionY; sectionY <= maximumSectionY; sectionY++) {
+            for (int chunkZ = minimumChunkZ; chunkZ <= maximumChunkZ; chunkZ++) {
+                for (int chunkX = minimumChunkX; chunkX <= maximumChunkX; chunkX++) {
+                    SectionKey section = sections.get(new SectionKey(chunkX, sectionY, chunkZ).packed());
+                    if (section != null) {
+                        markDirty(section, 1);
+                    }
+                }
             }
-            markDirty(section, 1);
         }
     }
 
@@ -242,15 +308,34 @@ public final class PaperTerrainRuntime implements AutoCloseable {
                     if (!revisions.markBuilt(key, revision)) {
                         return; // A newer invalidation owns this section now.
                     }
-                    sink.replaceSection(key.packed(), built.shape, built.pose);
-                    if (!revisions.markActive(key, revision)) {
+                    CompletionStage<Void> activation;
+                    try {
+                        activation = Objects.requireNonNull(
+                                sink.replaceSection(key.packed(), built.shape, built.pose),
+                                "Activation sink returned null");
+                    } catch (Throwable activationFailure) {
+                        revisions.markDirty(key, captured.work.priority());
                         return;
                     }
-                    sink.quarantine(key.bounds(sceneBounds), false);
-                    initialSections.remove(key.packed());
-                    if (initialSections.isEmpty() && !ready.isDone()) {
-                        ready.complete(null);
-                    }
+                    activationsInFlight.incrementAndGet();
+                    activation.whenComplete((ignored, activationFailure) -> completeOnMain(() -> {
+                        activationsInFlight.decrementAndGet();
+                        if (closed) {
+                            return;
+                        }
+                        if (activationFailure != null) {
+                            revisions.markDirty(key, captured.work.priority());
+                            return;
+                        }
+                        if (!revisions.markActive(key, revision)) {
+                            return;
+                        }
+                        sink.quarantine(key.bounds(sceneBounds), false);
+                        initialSections.remove(key.packed());
+                        if (initialSections.isEmpty() && !ready.isDone()) {
+                            ready.complete(null);
+                        }
+                    }));
                 }));
     }
 
@@ -358,6 +443,13 @@ public final class PaperTerrainRuntime implements AutoCloseable {
         }
     }
 
+    private void releaseTickets() {
+        for (Chunk chunk : ticketedChunks.values()) {
+            chunk.removePluginChunkTicket(plugin);
+        }
+        ticketedChunks.clear();
+    }
+
     private static int floorToInt(double value) {
         if (value < Integer.MIN_VALUE || value > Integer.MAX_VALUE) {
             throw new IllegalArgumentException("Scene bounds exceed integer world coordinates");
@@ -374,7 +466,7 @@ public final class PaperTerrainRuntime implements AutoCloseable {
 
     public interface ActivationSink {
         /** A null shape removes the static section. */
-        void replaceSection(long sectionKey, PhysicsShape shape, Pose worldPose);
+        CompletionStage<Void> replaceSection(long sectionKey, PhysicsShape shape, Pose worldPose);
 
         /** Called while an intersecting body's terrain is not authoritative. */
         default void quarantine(BoundingBox worldBounds, boolean quarantined) {
@@ -405,7 +497,7 @@ public final class PaperTerrainRuntime implements AutoCloseable {
             this.sizeY = ceilToInt(bounds.getMaxY()) - minY;
             this.sizeZ = ceilToInt(bounds.getMaxZ()) - minZ;
             this.anchor = new Vec3(minX, minY, minZ);
-            this.clip = bounds;
+            this.clip = sceneBounds.clone();
             this.full = new BitSet(sizeX * sizeY * sizeZ);
         }
 
