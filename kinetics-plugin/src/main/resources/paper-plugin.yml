@@ -1,0 +1,16 @@
+name: Kinetics
+version: '${version}'
+main: sh.harold.kinetics.plugin.KineticsPlugin
+description: Lightweight rigid-body physics for Paper entities
+api-version: '1.21.11'
+load: POSTWORLD
+dependencies:
+  server:
+    packetevents:
+      load: BEFORE
+      required: true
+      join-classpath: true
+permissions:
+  kinetics.admin:
+    description: Access Kinetics diagnostics
+    default: op

@@ -1,3 +1,5 @@
+import java.util.zip.ZipFile
+
 plugins {
     java
     id("com.gradleup.shadow")
@@ -36,4 +38,33 @@ tasks.shadowJar {
 
 tasks.assemble {
     dependsOn(tasks.shadowJar)
+}
+val verifyShadowJar = tasks.register("verifyShadowJar") {
+    dependsOn(tasks.shadowJar)
+    val archive = tasks.shadowJar.flatMap { it.archiveFile }
+    inputs.file(archive)
+
+    doLast {
+        val entries = ZipFile(archive.get().asFile).use { zip ->
+            zip.entries().asSequence().map { it.name }.toSet()
+        }
+        val required = setOf(
+            "paper-plugin.yml",
+            "META-INF/LICENSE-JOLT-JNI.txt",
+            "META-INF/LICENSE-JOLT-PHYSICS.txt",
+            "sh/harold/kinetics/api/Vec3.class",
+            "windows/x86-64/com/github/stephengold/joltjni.dll",
+            "linux/x86-64/com/github/stephengold/libjoltjni.so"
+        )
+        check(entries.containsAll(required)) {
+            "Shaded jar is missing: ${required - entries}"
+        }
+        check(entries.none { it.startsWith("com/github/retrooper/packetevents/") }) {
+            "PacketEvents must remain a server-provided dependency"
+        }
+    }
+}
+
+tasks.named("check") {
+    dependsOn(verifyShadowJar)
 }
