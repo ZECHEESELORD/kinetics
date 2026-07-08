@@ -9,7 +9,7 @@ import java.nio.file.StandardCopyOption;
 import java.util.Locale;
 
 final class NativeLibraryLoader {
-    private static final String VERSION = "5.1.0";
+    private static final String VERSION = "5.2.0";
 
     private NativeLibraryLoader() {
     }
