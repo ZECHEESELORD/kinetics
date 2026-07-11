@@ -38,6 +38,7 @@ public final class JoltBody implements PhysicsBody {
     volatile Vec3 scale;
     volatile PhysicsMaterial requestedMaterial;
     volatile ResolvedMaterial material;
+    volatile ShapeFactory.ShapeLease shapeLease;
     volatile ShapeFactory.CachedShape cachedShape;
     volatile double mass;
 

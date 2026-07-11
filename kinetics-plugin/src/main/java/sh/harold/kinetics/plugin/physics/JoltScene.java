@@ -56,7 +56,7 @@ public final class JoltScene implements PhysicsScene {
     private final SceneQueries queries;
     private final SceneContactCollector contacts;
     private final Object commandLock = new Object();
-    private final ArrayDeque<Runnable> commands = new ArrayDeque<>();
+    private final ArrayDeque<QueuedCommand> commands = new ArrayDeque<>();
     private final LinkedHashMap<BodyId, JoltBody> bodyMap = new LinkedHashMap<>();
     private final Map<Long, Integer> terrain = new HashMap<>();
     private final Map<BodyId, Integer> quarantineCounts = new HashMap<>();
@@ -96,14 +96,10 @@ public final class JoltScene implements PhysicsScene {
         this.origin = new Vec3(midpoint(box.getMinX(), box.getMaxX()),
                 midpoint(box.getMinY(), box.getMaxY()),
                 midpoint(box.getMinZ(), box.getMaxZ()));
-        pairs = new ObjectLayerPairFilterTable(2);
-        pairs.enableCollision(MOVING_LAYER, MOVING_LAYER);
-        pairs.enableCollision(MOVING_LAYER, STATIC_LAYER);
-        layers = new BroadPhaseLayerInterfaceTable(2, 2);
-        layers.mapObjectToBroadPhaseLayer(STATIC_LAYER, 0);
-        layers.mapObjectToBroadPhaseLayer(MOVING_LAYER, 1);
-        broadphase = new ObjectVsBroadPhaseLayerFilterTable(layers, 2, pairs, 2);
-        long maximumLong = (long) spec.maximumBodies() + terrainSectionCapacity(box) + 6L;
+        long terrainCapacity = spec.terrainCollision()
+                ? (long) terrainSectionCapacity(
+                        box, spec.world().getMinHeight(), spec.world().getMaxHeight()) + 1L : 0L;
+        long maximumLong = (long) spec.maximumBodies() + terrainCapacity + 6L;
         if (maximumLong > 1_000_000L) {
             throw new IllegalArgumentException("Scene bounds require too many native bodies: " + maximumLong);
         }
@@ -111,36 +107,69 @@ public final class JoltScene implements PhysicsScene {
         int maximumPairs = (int) Math.min(Integer.MAX_VALUE, Math.max(65_536L, maximumLong * 12L));
         int maximumConstraints = (int) Math.min(Integer.MAX_VALUE,
                 Math.max(20_480L, maximumLong * 6L));
-        system = new PhysicsSystem();
-        system.init(maximum, 0, maximumPairs, maximumConstraints, layers, broadphase, pairs);
-        try (PhysicsSettings settings = system.getPhysicsSettings()) {
-            settings.setPenetrationSlop(0.001f);
-            settings.setSpeculativeContactDistance(0.005f);
-            system.setPhysicsSettings(settings);
-        }
-        system.setGravity(0, -9.80665f, 0);
-        bodies = system.getBodyInterface();
-        queries = new SceneQueries(this);
-        contacts = new SceneContactCollector(this);
-        system.setContactListener(contacts);
+
+        ObjectLayerPairFilterTable createdPairs = null;
+        BroadPhaseLayerInterfaceTable createdLayers = null;
+        ObjectVsBroadPhaseLayerFilterTable createdBroadphase = null;
+        PhysicsSystem createdSystem = null;
+        SceneQueries createdQueries = null;
+        SceneContactCollector createdContacts = null;
         try {
+            createdPairs = new ObjectLayerPairFilterTable(2);
+            createdPairs.enableCollision(MOVING_LAYER, MOVING_LAYER);
+            createdPairs.enableCollision(MOVING_LAYER, STATIC_LAYER);
+            createdLayers = new BroadPhaseLayerInterfaceTable(2, 2);
+            createdLayers.mapObjectToBroadPhaseLayer(STATIC_LAYER, 0);
+            createdLayers.mapObjectToBroadPhaseLayer(MOVING_LAYER, 1);
+            createdBroadphase = new ObjectVsBroadPhaseLayerFilterTable(
+                    createdLayers, 2, createdPairs, 2);
+            createdSystem = new PhysicsSystem();
+            createdSystem.init(maximum, 0, maximumPairs, maximumConstraints,
+                    createdLayers, createdBroadphase, createdPairs);
+            try (PhysicsSettings settings = createdSystem.getPhysicsSettings()) {
+                settings.setPenetrationSlop(0.001f);
+                settings.setSpeculativeContactDistance(0.005f);
+                createdSystem.setPhysicsSettings(settings);
+            }
+            createdSystem.setGravity(0, -9.80665f, 0);
+
+            pairs = createdPairs;
+            layers = createdLayers;
+            broadphase = createdBroadphase;
+            system = createdSystem;
+            bodies = createdSystem.getBodyInterface();
+            createdQueries = new SceneQueries(this);
+            createdContacts = new SceneContactCollector(this);
+            queries = createdQueries;
+            contacts = createdContacts;
+            system.setContactListener(contacts);
             createWalls(box);
             system.optimizeBroadPhase();
         } catch (Throwable failure) {
-            system.setContactListener(null);
-            contacts.close();
-            queries.close();
-            system.destroyAllBodies();
-            system.forgetMe();
-            system.close();
-            shapes.close();
-            broadphase.close();
-            layers.close();
-            pairs.close();
-            throw failure;
+            SceneContactCollector contactsToClose = createdContacts;
+            SceneQueries queriesToClose = createdQueries;
+            PhysicsSystem systemToClose = createdSystem;
+            ObjectVsBroadPhaseLayerFilterTable broadphaseToClose = createdBroadphase;
+            BroadPhaseLayerInterfaceTable layersToClose = createdLayers;
+            ObjectLayerPairFilterTable pairsToClose = createdPairs;
+            if (systemToClose != null)
+                failure = attempt(failure, () -> systemToClose.setContactListener(null));
+            if (contactsToClose != null) failure = attempt(failure, contactsToClose::close);
+            if (queriesToClose != null) failure = attempt(failure, queriesToClose::close);
+            if (systemToClose != null) {
+                failure = attempt(failure, systemToClose::destroyAllBodies);
+                failure = attempt(failure, systemToClose::forgetMe);
+                failure = attempt(failure, systemToClose::close);
+            }
+            failure = attempt(failure, shapes::close);
+            if (broadphaseToClose != null) failure = attempt(failure, broadphaseToClose::close);
+            if (layersToClose != null) failure = attempt(failure, layersToClose::close);
+            if (pairsToClose != null) failure = attempt(failure, pairsToClose::close);
+            if (failure instanceof RuntimeException runtimeFailure) throw runtimeFailure;
+            if (failure instanceof Error error) throw error;
+            throw new CompletionException(failure);
         }
     }
-
     @Override public String name() { return spec.name(); }
     @Override public World world() { return spec.world(); }
     @Override public SceneSpec spec() { return spec; }
@@ -158,18 +187,26 @@ public final class JoltScene implements PhysicsScene {
             PhysicsShape shape, ColliderFidelity fidelity, BodyBinding binding, boolean yawOnly) {
         CompletableFuture<PhysicsBody> future = new CompletableFuture<>();
         enqueue(() -> {
+            JoltBody body = null;
             try {
                 if (bodyMap.size() >= spec.maximumBodies()) throw new IllegalStateException("Scene body limit reached");
-                JoltBody body = new JoltBody(this, new BodyId(NEXT_ID.getAndIncrement()),
+                body = new JoltBody(this, new BodyId(NEXT_ID.getAndIncrement()),
                         bodySpec, shape, fidelity, binding, yawOnly, pose);
                 createNative(body, pose);
-                bodyMap.put(body.id, body);
-                byPublicId.put(body.id.value(), body);
-                byJoltId.put(body.joltId, body);
-                layoutDirty = true;
+                try {
+                    bodyMap.put(body.id, body);
+                    byPublicId.put(body.id.value(), body);
+                    byJoltId.put(body.joltId, body);
+                    layoutDirty = true;
+                } catch (Throwable failure) {
+                    removeNative(body);
+                    throw failure;
+                }
                 complete(future, body, null);
-            } catch (Throwable failure) { complete(future, null, failure); }
-        });
+            } catch (Throwable failure) {
+                complete(future, null, failure);
+            }
+        }, future);
         return future;
     }
 
@@ -236,6 +273,7 @@ public final class JoltScene implements PhysicsScene {
 
     void dispatchContact(ContactEvent event) {
         mainExecutor.accept(() -> {
+            if (closed()) return;
             for (ContactRegistration registration : contactListeners) {
                 try {
                     if (registration.active() && registration.phases.contains(event.phase())
@@ -299,25 +337,35 @@ public final class JoltScene implements PhysicsScene {
 
     public CompletionStage<Void> replaceTerrainSection(long key, PhysicsShape shape, Pose pose) {
         CompletableFuture<Void> future = new CompletableFuture<>();
-        try {
-            enqueue(() -> {
-                try {
-                    Integer replacement = null;
-                    if (shape != null) {
-                        ShapeFactory.CachedShape cached = shapes.acquire(shape, Vec3.ONE, Vec3.ZERO);
-                        replacement = createStatic(cached, pose);
+        enqueue(() -> {
+            Integer replacement = null;
+            try {
+                if (shape != null) {
+                    try (ShapeFactory.ShapeLease lease = shapes.acquire(shape, Vec3.ONE, Vec3.ZERO)) {
+                        replacement = createStatic(lease.shape(), pose);
                     }
-                    Integer old = terrain.remove(key);
-                    if (old != null) { bodies.removeBody(old); bodies.destroyBody(old); }
-                    if (replacement != null) terrain.put(key, replacement);
-                    complete(future, null, null);
-                } catch (Throwable failure) {
-                    complete(future, null, failure);
                 }
-            });
-        } catch (Throwable failure) {
-            complete(future, null, failure);
-        }
+                Integer old = terrain.get(key);
+                if (old != null) {
+                    if (bodies.isAdded(old)) bodies.removeBody(old);
+                    bodies.destroyBody(old);
+                }
+                if (replacement == null) terrain.remove(key);
+                else terrain.put(key, replacement);
+                complete(future, null, null);
+            } catch (Throwable failure) {
+                if (replacement != null) {
+                    int failedReplacement = replacement;
+                    Throwable cleanupFailure = attempt(null, () -> {
+                        if (bodies.isAdded(failedReplacement)) bodies.removeBody(failedReplacement);
+                    });
+                    cleanupFailure = attempt(cleanupFailure, () -> bodies.destroyBody(failedReplacement));
+                    if (cleanupFailure != null && cleanupFailure != failure)
+                        failure.addSuppressed(cleanupFailure);
+                }
+                complete(future, null, failure);
+            }
+        }, future);
         return future;
     }
 
@@ -381,12 +429,12 @@ public final class JoltScene implements PhysicsScene {
     }
 
     void setAngularVelocity(JoltBody body, Vec3 velocity) {
-        com.github.stephengold.joltjni.Vec3 limited = nativeVec(
-                limitMagnitude(velocity, maxAngular(body.cachedShape)));
-        enqueueBody(body, () -> bodies.setAngularVelocity(body.joltId, limited));
+        enqueueBody(body, () -> bodies.setAngularVelocity(body.joltId,
+                nativeVec(limitMagnitude(velocity, maxAngular(body.cachedShape)))));
     }
 
     void teleport(JoltBody body, Pose pose) { enqueueBody(body, () -> {
+        boolean wasActive = bodies.isActive(body.joltId);
         bodies.removeBody(body.joltId);
         try {
             if (insideScene(body.cachedShape, pose)
@@ -397,7 +445,8 @@ public final class JoltScene implements PhysicsScene {
 
             }
         } finally {
-            bodies.addBody(body.joltId, EActivation.Activate);
+            bodies.addBody(body.joltId,
+                    wasActive ? EActivation.Activate : EActivation.DontActivate);
         }
     }); }
 
@@ -459,6 +508,7 @@ public final class JoltScene implements PhysicsScene {
     CompletionStage<ResizeResult> resize(JoltBody body, Vec3 scale) {
         CompletableFuture<ResizeResult> future = new CompletableFuture<>();
         enqueue(() -> {
+            ShapeFactory.ShapeLease replacementLease = null;
             try {
                 validateScale(scale);
                 if (body.yawOnly && (scale.x() != scale.y() || scale.x() != scale.z()))
@@ -467,9 +517,10 @@ public final class JoltScene implements PhysicsScene {
                     complete(future, new ResizeResult(ResizeResult.Status.BODY_DESTROYED, "Body destroyed"), null);
                     return;
                 }
-                ShapeFactory.CachedShape replacement = shapes.acquire(
-                        body.definition, scale, body.spec.centreOfMassOffset());
+                replacementLease = shapes.acquire(body.definition, scale, body.spec.centreOfMassOffset());
+                ShapeFactory.CachedShape replacement = replacementLease.shape();
                 ShapeFactory.CachedShape original = body.cachedShape;
+                ShapeFactory.ShapeLease originalLease = body.shapeLease;
                 double originalMass = body.mass;
                 Pose currentPose = nativePose(body);
                 if (!insideScene(replacement, currentPose)) {
@@ -477,43 +528,63 @@ public final class JoltScene implements PhysicsScene {
                             "Collider outside scene bounds"), null);
                     return;
                 }
-                boolean[] changed = {false};
+
+                boolean wasActive = bodies.isActive(body.joltId);
+                boolean changed = false;
+                EMotionQuality originalQuality = body.spec.motionType() == MotionType.STATIC
+                        ? EMotionQuality.Discrete : bodies.getMotionQuality(body.joltId);
                 bodies.removeBody(body.joltId);
+                ResizeResult result;
                 try {
                     if (queries.overlaps(replacement, currentPose, body.joltId)) {
-                        complete(future, new ResizeResult(ResizeResult.Status.BLOCKED, "Collider overlaps"), null);
-                        return;
+                        result = new ResizeResult(ResizeResult.Status.BLOCKED, "Collider overlaps");
+                    } else {
+                        bodies.setShape(body.joltId, replacement.shape(), false, EActivation.DontActivate);
+                        changed = true;
+                        double mass = body.spec.massKilograms().orElse(
+                                replacement.massAtDensity(body.material.densityKilogramsPerCubicMetre()));
+                        if (body.spec.motionType() == MotionType.DYNAMIC)
+                            applyMass(body, replacement, mass);
+                        if (body.spec.motionType() != MotionType.STATIC) {
+                            setMaxAngularVelocity(body, maxAngular(replacement));
+                            bodies.setMotionQuality(body.joltId, nativeQuality(body, replacement));
+                        }
+                        originalLease.close();
+                        body.shapeLease = replacementLease;
+                        body.cachedShape = replacement;
+                        body.scale = scale;
+                        body.mass = mass;
+                        replacementLease = null;
+                        result = new ResizeResult(ResizeResult.Status.APPLIED, "");
                     }
-                    bodies.setShape(body.joltId, replacement.shape(), false, EActivation.DontActivate);
-                    changed[0] = true;
-                    double mass = body.spec.massKilograms().orElse(
-                            replacement.massAtDensity(body.material.densityKilogramsPerCubicMetre()));
-                    if (body.spec.motionType() == MotionType.DYNAMIC) applyMass(body, replacement, mass);
-                    body.cachedShape = replacement;
-                    body.scale = scale;
-                    body.mass = mass;
-                    complete(future, new ResizeResult(ResizeResult.Status.APPLIED, ""), null);
                 } catch (Throwable failure) {
-                    if (changed[0]) {
+                    if (changed) {
                         try {
                             bodies.setShape(body.joltId, original.shape(), false, EActivation.DontActivate);
                             if (body.spec.motionType() == MotionType.DYNAMIC)
                                 applyMass(body, original, originalMass);
+                            if (body.spec.motionType() != MotionType.STATIC) {
+                                setMaxAngularVelocity(body, maxAngular(original));
+                                bodies.setMotionQuality(body.joltId, originalQuality);
+                            }
                         } catch (Throwable rollbackFailure) {
                             failure.addSuppressed(rollbackFailure);
                         }
                     }
-                    complete(future, null, failure);
+                    throw failure;
                 } finally {
-                    bodies.addBody(body.joltId, EActivation.Activate);
+                    bodies.addBody(body.joltId,
+                            wasActive ? EActivation.Activate : EActivation.DontActivate);
                 }
+                complete(future, result, null);
             } catch (Throwable failure) {
                 complete(future, null, failure);
+            } finally {
+                if (replacementLease != null) replacementLease.close();
             }
-        });
+        }, future);
         return future;
     }
-
     CompletionStage<Void> destroy(JoltBody body) {
         CompletableFuture<Optional<Entity>> created = new CompletableFuture<>();
         if (!body.terminal.compareAndSet(null, created))
@@ -532,11 +603,11 @@ public final class JoltScene implements PhysicsScene {
                         }
                     });
                 } catch (Throwable failure) {
-                    mainExecutor.accept(() -> created.completeExceptionally(failure));
+                    complete(created, null, failure);
                 }
-            });
+            }, created);
         } catch (Throwable failure) {
-            mainExecutor.accept(() -> created.completeExceptionally(failure));
+            complete(created, null, failure);
         }
         return created.thenApply(ignored -> null);
     }
@@ -561,45 +632,93 @@ public final class JoltScene implements PhysicsScene {
                         }
                     });
                 } catch (Throwable failure) {
-                    mainExecutor.accept(() -> created.completeExceptionally(failure));
+                    complete(created, null, failure);
                 }
-            });
+            }, created);
         } catch (Throwable failure) {
-            mainExecutor.accept(() -> created.completeExceptionally(failure));
+            complete(created, null, failure);
         }
         return created;
     }
 
-    void enqueue(Runnable command) { enqueue(command, false); }
-    private void enqueue(Runnable command, boolean allowClosing) {
-        synchronized (commandLock) {
-            if (closed || closeRequested.get() && !allowClosing) throw new IllegalStateException("Scene closed");
-            commands.addLast(command);
-        }
-        requestStep.run();
+    void enqueue(Runnable command) {
+        enqueue(command, false, ignored -> { });
     }
-    private void enqueueBody(JoltBody body, Runnable command) { if (!body.destroyed()) enqueue(() -> { if (!body.destroyed) command.run(); }); }
+
+    <T> void enqueue(Runnable command, CompletableFuture<T> future) {
+        try {
+            enqueue(command, false, failure -> complete(future, null, failure));
+        } catch (Throwable failure) {
+            complete(future, null, failure);
+        }
+    }
+
+    private void enqueue(Runnable command, boolean allowClosing) {
+        enqueue(command, allowClosing, ignored -> { });
+    }
+
+    private void enqueue(Runnable command, boolean allowClosing, Consumer<Throwable> cancellation) {
+        QueuedCommand queued = new QueuedCommand(command, cancellation);
+        synchronized (commandLock) {
+            if (closed || closeRequested.get() && !allowClosing)
+                throw new IllegalStateException("Scene closed");
+            commands.addLast(queued);
+        }
+        try {
+            requestStep.run();
+        } catch (Throwable failure) {
+            synchronized (commandLock) {
+                commands.remove(queued);
+            }
+            queued.cancel(failure);
+            throw failure;
+        }
+    }
+
+    private void enqueueBody(JoltBody body, Runnable command) {
+        if (!body.destroyed()) enqueue(() -> {
+            if (!body.destroyed) command.run();
+        });
+    }
+
+    void drainCommandsForShutdown() {
+        if (!closed) drainCommands();
+    }
+
     private void drainCommands() {
-        List<Runnable> pending;
+        List<QueuedCommand> pending;
         synchronized (commandLock) {
             pending = new ArrayList<>(commands);
             commands.clear();
         }
         Throwable firstFailure = null;
-        for (Runnable command : pending) {
+        for (int i = 0; i < pending.size(); i++) {
+            QueuedCommand command = pending.get(i);
             try {
                 command.run();
             } catch (Throwable failure) {
                 if (firstFailure == null) firstFailure = failure;
                 else firstFailure.addSuppressed(failure);
             }
-            if (closed) return;
+            if (closed) {
+                CancellationException cancellation = new CancellationException("Scene closed");
+                for (int j = i + 1; j < pending.size(); j++) pending.get(j).cancel(cancellation);
+                break;
+            }
         }
         if (firstFailure instanceof RuntimeException runtimeFailure) throw runtimeFailure;
         if (firstFailure instanceof Error error) throw error;
         if (firstFailure != null) throw new CompletionException(firstFailure);
     }
 
+    private void cancelPending(Throwable failure) {
+        List<QueuedCommand> pending;
+        synchronized (commandLock) {
+            pending = new ArrayList<>(commands);
+            commands.clear();
+        }
+        for (QueuedCommand command : pending) command.cancel(failure);
+    }
     private Pose nativePose(JoltBody body) {
         RVec3 position = bodies.getPosition(body.joltId);
         Quat rotation = bodies.getRotation(body.joltId);
@@ -656,58 +775,89 @@ public final class JoltScene implements PhysicsScene {
     }
 
     <T> void complete(CompletableFuture<T> future, T value, Throwable error) {
-        mainExecutor.accept(() -> { if (error == null) future.complete(value); else future.completeExceptionally(error); });
+        Runnable completion = () -> {
+            if (error == null) future.complete(value);
+            else future.completeExceptionally(error);
+        };
+        try {
+            mainExecutor.accept(completion);
+        } catch (Throwable schedulingFailure) {
+            if (error != null) schedulingFailure.addSuppressed(error);
+            future.completeExceptionally(schedulingFailure);
+        }
     }
 
     private void createNative(JoltBody body, Pose pose) {
         body.material = MaterialResolver.resolve(body.binding.materialHint(), body.requestedMaterial);
-        body.cachedShape = shapes.acquire(body.definition, body.scale, body.spec.centreOfMassOffset());
-        if (!insideScene(body.cachedShape, pose))
-            throw new IllegalArgumentException("Initial collider is outside scene bounds");
-        if (queries.overlaps(body.cachedShape, pose, -1))
-            throw new IllegalArgumentException("Initial collider overlaps scene geometry");
-        body.mass = body.spec.massKilograms().orElse(
-                body.cachedShape.massAtDensity(body.material.densityKilogramsPerCubicMetre()));
-        com.github.stephengold.joltjni.enumerate.EMotionType motion = switch (body.spec.motionType()) {
-            case STATIC -> com.github.stephengold.joltjni.enumerate.EMotionType.Static;
-            case KINEMATIC -> com.github.stephengold.joltjni.enumerate.EMotionType.Kinematic;
-            case DYNAMIC -> com.github.stephengold.joltjni.enumerate.EMotionType.Dynamic;
-        };
-        int layer = body.spec.motionType() == MotionType.STATIC ? STATIC_LAYER : MOVING_LAYER;
-        try (BodyCreationSettings settings = new BodyCreationSettings(body.cachedShape.shape(),
-                local(pose.position()), nativeQuat(pose.rotation()), motion, layer)) {
-            settings.setFriction(friction(body.material))
-                    .setRestitution((float) body.material.restitution())
-                    .setLinearDamping(nativeFloat(body.material.linearDamping(), "linearDamping"))
-                    .setAngularDamping(nativeFloat(body.material.angularDamping(), "angularDamping"))
-                    .setGravityFactor(nativeFloat(body.spec.gravityScale(), "gravityScale"))
-                    .setAllowSleeping(body.spec.sleepAllowed())
-                    .setMaxLinearVelocity(128f)
-                    .setMaxAngularVelocity(maxAngular(body.cachedShape))
-                    .setMotionQuality(nativeQuality(body))
-                    .setUserData(body.id.value());
-            if (body.yawOnly) settings.setAllowedDofs(EAllowedDofs.TranslationX | EAllowedDofs.TranslationY
-                    | EAllowedDofs.TranslationZ | EAllowedDofs.RotationY);
-            if (body.spec.motionType() == MotionType.DYNAMIC) {
-                settings.setOverrideMassProperties(EOverrideMassProperties.CalculateInertia);
-                settings.getMassPropertiesOverride().setMass(positiveNativeFloat(body.mass, "massKilograms"));
-            }
-            body.joltId = bodies.createAndAddBody(settings,
-                    body.spec.motionType() == MotionType.STATIC ? EActivation.DontActivate : EActivation.Activate);
-            if (body.joltId == Jolt.cInvalidBodyId) throw new IllegalStateException("Jolt body capacity exhausted");
-            if (body.spec.motionType() != MotionType.STATIC) {
-                int quarantines = 0;
-                BoundingBox bounds = transformedBounds(body.cachedShape, nativePose(body));
-                for (BoundsKey region : quarantineRegions) if (bounds.overlaps(region.bounds())) quarantines++;
-                if (quarantines > 0) {
-                    quarantineCounts.put(body.id, quarantines);
-                    quarantineWake.add(body.id);
-                    bodies.deactivateBody(body.joltId);
+        ShapeFactory.ShapeLease lease = shapes.acquire(
+                body.definition, body.scale, body.spec.centreOfMassOffset());
+        ShapeFactory.CachedShape cached = lease.shape();
+        body.shapeLease = lease;
+        body.cachedShape = cached;
+        boolean nativeCreated = false;
+        try {
+            if (!insideScene(cached, pose))
+                throw new IllegalArgumentException("Initial collider is outside scene bounds");
+            if (queries.overlaps(cached, pose, -1))
+                throw new IllegalArgumentException("Initial collider overlaps scene geometry");
+            body.mass = body.spec.massKilograms().orElse(
+                    cached.massAtDensity(body.material.densityKilogramsPerCubicMetre()));
+            com.github.stephengold.joltjni.enumerate.EMotionType motion = switch (body.spec.motionType()) {
+                case STATIC -> com.github.stephengold.joltjni.enumerate.EMotionType.Static;
+                case KINEMATIC -> com.github.stephengold.joltjni.enumerate.EMotionType.Kinematic;
+                case DYNAMIC -> com.github.stephengold.joltjni.enumerate.EMotionType.Dynamic;
+            };
+            int layer = body.spec.motionType() == MotionType.STATIC ? STATIC_LAYER : MOVING_LAYER;
+            try (BodyCreationSettings settings = new BodyCreationSettings(cached.shape(),
+                    local(pose.position()), nativeQuat(pose.rotation()), motion, layer)) {
+                settings.setFriction(friction(body.material))
+                        .setRestitution((float) body.material.restitution())
+                        .setLinearDamping(nativeFloat(body.material.linearDamping(), "linearDamping"))
+                        .setAngularDamping(nativeFloat(body.material.angularDamping(), "angularDamping"))
+                        .setGravityFactor(nativeFloat(body.spec.gravityScale(), "gravityScale"))
+                        .setAllowSleeping(body.spec.sleepAllowed())
+                        .setMaxLinearVelocity(128f)
+                        .setMaxAngularVelocity(maxAngular(cached))
+                        .setMotionQuality(nativeQuality(body, cached))
+                        .setUserData(body.id.value());
+                if (body.yawOnly) settings.setAllowedDofs(EAllowedDofs.TranslationX | EAllowedDofs.TranslationY
+                        | EAllowedDofs.TranslationZ | EAllowedDofs.RotationY);
+                if (body.spec.motionType() == MotionType.DYNAMIC) {
+                    settings.setOverrideMassProperties(EOverrideMassProperties.CalculateInertia);
+                    settings.getMassPropertiesOverride().setMass(
+                            positiveNativeFloat(body.mass, "massKilograms"));
+                }
+                body.joltId = bodies.createAndAddBody(settings,
+                        body.spec.motionType() == MotionType.STATIC
+                                ? EActivation.DontActivate : EActivation.Activate);
+                if (body.joltId == Jolt.cInvalidBodyId)
+                    throw new IllegalStateException("Jolt body capacity exhausted");
+                nativeCreated = true;
+                if (body.spec.motionType() != MotionType.STATIC) {
+                    int quarantines = 0;
+                    BoundingBox bounds = transformedBounds(cached, nativePose(body));
+                    for (BoundsKey region : quarantineRegions)
+                        if (bounds.overlaps(region.bounds())) quarantines++;
+                    if (quarantines > 0) {
+                        quarantineCounts.put(body.id, quarantines);
+                        quarantineWake.add(body.id);
+                        bodies.deactivateBody(body.joltId);
+                    }
                 }
             }
+        } catch (Throwable failure) {
+            if (nativeCreated) {
+                failure = attempt(failure, () -> bodies.removeBody(body.joltId));
+                failure = attempt(failure, () -> bodies.destroyBody(body.joltId));
+            }
+            quarantineCounts.remove(body.id);
+            quarantineWake.remove(body.id);
+            body.shapeLease = null;
+            body.cachedShape = null;
+            failure = attempt(failure, lease::close);
+            throwUnchecked(failure);
         }
     }
-
     private int createStatic(ShapeFactory.CachedShape shape, Pose pose) {
         try (BodyCreationSettings settings = new BodyCreationSettings(shape.shape(), local(pose.position()),
                 nativeQuat(pose.rotation()), com.github.stephengold.joltjni.enumerate.EMotionType.Static, STATIC_LAYER)) {
@@ -892,6 +1042,23 @@ public final class JoltScene implements PhysicsScene {
     private record PublishedSnapshot(List<JoltBody> bodies, BodyState[] states) {
     }
 
+    private record QueuedCommand(Runnable action, Consumer<Throwable> cancellation) {
+        void run() {
+            action.run();
+        }
+
+        void cancel(Throwable failure) {
+            cancellation.accept(failure);
+        }
+    }
+
+    private void setMaxAngularVelocity(JoltBody body, float maximum) {
+        try (BodyLockWrite lock = new BodyLockWrite(system.getBodyLockInterface(), body.joltId)) {
+            if (!lock.succeeded()) throw new IllegalStateException("Body vanished during resize");
+            lock.getBody().getMotionPropertiesUnchecked().setMaxAngularVelocity(maximum);
+        }
+    }
+
     private void applyMass(JoltBody body, ShapeFactory.CachedShape shape, double mass) {
         try (MassProperties properties = shape.shape().getMassProperties();
                 BodyLockWrite lock = new BodyLockWrite(system.getBodyLockInterface(), body.joltId)) {
@@ -906,13 +1073,25 @@ public final class JoltScene implements PhysicsScene {
 
     private void removeNative(JoltBody body) {
         if (body.destroyed) return;
-        bodies.removeBody(body.joltId); bodies.destroyBody(body.joltId); body.destroyed = true;
-        bodyMap.remove(body.id); byPublicId.remove(body.id.value()); byJoltId.remove(body.joltId);
-        quarantineCounts.remove(body.id); quarantineWake.remove(body.id); layoutDirty = true;
+        body.destroyed = true;
+        Throwable failure = null;
+        failure = attempt(failure, () -> bodies.removeBody(body.joltId));
+        failure = attempt(failure, () -> bodies.destroyBody(body.joltId));
+        bodyMap.remove(body.id);
+        byPublicId.remove(body.id.value());
+        byJoltId.remove(body.joltId);
+        quarantineCounts.remove(body.id);
+        quarantineWake.remove(body.id);
+        ShapeFactory.ShapeLease lease = body.shapeLease;
+        body.shapeLease = null;
+        body.cachedShape = null;
+        if (lease != null) failure = attempt(failure, lease::close);
+        layoutDirty = true;
+        if (failure != null) throwUnchecked(failure);
     }
 
     void cleanupBindingsOnMain(Consumer<Throwable> errorHandler) {
-        if (mainCleanupDone) return;
+        if (mainCleanupDone || closed) return;
         mainCleanupDone = true;
         for (JoltBody body : List.copyOf(bodyMap.values())) {
             try {
@@ -929,30 +1108,47 @@ public final class JoltScene implements PhysicsScene {
     }
 
     void shutdownNowNative() {
-        if (!closed) closeNative();
+        if (closed) return;
+        cancelPending(new CancellationException("Scene closed before queued work completed"));
+        closeNative();
     }
 
     private void closeNative() {
+        if (closed) return;
+        Throwable failure = null;
         for (JoltBody body : List.copyOf(bodyMap.values())) {
-            removeNative(body);
-            if (!mainCleanupDone) mainExecutor.accept(body.binding::ownerCleanup);
+            failure = attempt(failure, () -> removeNative(body));
+            if (!mainCleanupDone)
+                failure = attempt(failure, () -> mainExecutor.accept(body.binding::ownerCleanup));
         }
-        if (!mainCleanupDone) mainExecutor.accept(bridge::close);
-        system.setContactListener(null); contacts.close(); queries.close();
-        if (ids != null) ids.close();
-        system.destroyAllBodies(); system.forgetMe(); system.close(); shapes.close();
-        broadphase.close(); layers.close(); pairs.close(); closed = true;
+        if (!mainCleanupDone)
+            failure = attempt(failure, () -> mainExecutor.accept(bridge::close));
+        failure = attempt(failure, () -> system.setContactListener(null));
+        failure = attempt(failure, contacts::close);
+        failure = attempt(failure, queries::close);
+        if (ids != null) failure = attempt(failure, ids::close);
+        failure = attempt(failure, system::destroyAllBodies);
+        failure = attempt(failure, system::forgetMe);
+        failure = attempt(failure, system::close);
+        failure = attempt(failure, shapes::close);
+        failure = attempt(failure, broadphase::close);
+        failure = attempt(failure, layers::close);
+        failure = attempt(failure, pairs::close);
+        terrain.clear();
+        closed = true;
         CompletableFuture<Void> pending = closeFuture.get();
-        if (pending != null) complete(pending, null, null);
+        if (pending != null) complete(pending, null, failure);
+        if (failure != null) throwUnchecked(failure);
     }
-
-    private static int terrainSectionCapacity(BoundingBox bounds) {
+    static int terrainSectionCapacity(BoundingBox bounds, int worldMinimumY, int worldMaximumY) {
         long chunksX = (long) Math.ceil(bounds.getMaxX() / 16.0)
                 - (long) Math.floor(bounds.getMinX() / 16.0);
         long chunksZ = (long) Math.ceil(bounds.getMaxZ() / 16.0)
                 - (long) Math.floor(bounds.getMinZ() / 16.0);
-        long sectionsY = (long) Math.ceil(bounds.getMaxY() / 16.0)
-                - (long) Math.floor(bounds.getMinY() / 16.0);
+        double minimumY = Math.max(bounds.getMinY(), worldMinimumY);
+        double maximumY = Math.min(bounds.getMaxY(), worldMaximumY);
+        long sectionsY = maximumY <= minimumY ? 0L
+                : (long) Math.ceil(maximumY / 16.0) - (long) Math.floor(minimumY / 16.0);
         long sections = Math.multiplyExact(Math.multiplyExact(chunksX, chunksZ), sectionsY);
         if (sections > Integer.MAX_VALUE) throw new IllegalArgumentException("Scene terrain is too large");
         return (int) sections;
@@ -994,7 +1190,7 @@ public final class JoltScene implements PhysicsScene {
 
     private static BoundingBox transformedBounds(ShapeFactory.CachedShape shape, Pose pose) {
         Rotation q = pose.rotation();
-        Vec3 localCentre = shape.boundsCentre();
+        Vec3 localCentre = shape.centreOfMass().add(shape.boundsCentre());
         Vec3 worldCentre = pose.position().add(rotate(q, localCentre));
         Vec3 half = shape.halfExtents();
         double xx = q.x() * q.x(), yy = q.y() * q.y(), zz = q.z() * q.z();
@@ -1030,6 +1226,22 @@ public final class JoltScene implements PhysicsScene {
         double scale = maximum / normalizedLength;
         return new Vec3(x * scale, y * scale, z * scale);
     }
+    private static Throwable attempt(Throwable first, Runnable action) {
+        try {
+            action.run();
+        } catch (Throwable failure) {
+            if (first == null) return failure;
+            first.addSuppressed(failure);
+        }
+        return first;
+    }
+
+    private static void throwUnchecked(Throwable failure) {
+        if (failure instanceof RuntimeException runtimeFailure) throw runtimeFailure;
+        if (failure instanceof Error error) throw error;
+        throw new CompletionException(failure);
+    }
+
     private static double midpoint(double minimum, double maximum) {
         return minimum * 0.5 + maximum * 0.5;
     }
@@ -1038,11 +1250,12 @@ public final class JoltScene implements PhysicsScene {
         return (float)Math.max(1, Math.min(100, 60 / Math.max(.01, radius)));
     }
 
-    private static EMotionQuality nativeQuality(JoltBody body) {
+    private static EMotionQuality nativeQuality(JoltBody body, ShapeFactory.CachedShape shape) {
         return switch (body.spec.motionQuality()) {
             case DISCRETE -> EMotionQuality.Discrete;
             case CONTINUOUS -> EMotionQuality.LinearCast;
-            case AUTO -> body.cachedShape.minimumThickness() < .25 ? EMotionQuality.LinearCast : EMotionQuality.Discrete;
+            case AUTO -> shape.minimumThickness() < .25
+                    ? EMotionQuality.LinearCast : EMotionQuality.Discrete;
         };
     }
     private static float friction(ResolvedMaterial material) {

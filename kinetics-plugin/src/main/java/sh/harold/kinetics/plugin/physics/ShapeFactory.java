@@ -17,6 +17,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CompletionException;
 import sh.harold.kinetics.api.PhysicsShape;
 import sh.harold.kinetics.api.Rotation;
 import sh.harold.kinetics.api.Vec3;
@@ -25,21 +26,22 @@ public final class ShapeFactory implements AutoCloseable {
     public static final double MIN_THICKNESS = 0.005;
     private static final double JOLT_DEFAULT_DENSITY = 1_000.0;
 
-    private final Map<ShapeKey, CachedShape> cache = new HashMap<>();
+    private final Map<ShapeKey, CacheEntry> cache = new HashMap<>();
     private volatile long hits;
     private volatile long misses;
 
-    public CachedShape acquire(PhysicsShape definition, Vec3 scale, Vec3 centreOfMassOffset) {
+    public ShapeLease acquire(PhysicsShape definition, Vec3 scale, Vec3 centreOfMassOffset) {
         ShapeKey key = new ShapeKey(definition, scale, centreOfMassOffset);
-        CachedShape cached = cache.get(key);
-        if (cached != null) {
+        CacheEntry entry = cache.get(key);
+        if (entry != null) {
             hits++;
-            return cached;
+            entry.references++;
+            return new ShapeLease(this, key, entry.shape);
         }
         misses++;
         CachedShape created = create(definition, scale, centreOfMassOffset);
-        cache.put(key, created);
-        return created;
+        cache.put(key, new CacheEntry(created));
+        return new ShapeLease(this, key, created);
     }
 
     public long hits() {
@@ -57,6 +59,10 @@ public final class ShapeFactory implements AutoCloseable {
             Vec3 physicalScale = physicalScale(shape, scale);
             if (!physicalScale.equals(Vec3.ONE)) {
                 com.github.stephengold.joltjni.Vec3 factors = jolt(physicalScale);
+                if (!shape.isValidScale(factors)) {
+                    throw new IllegalArgumentException("Scale " + scale
+                            + " is unsupported for " + definition.getClass().getSimpleName());
+                }
                 try (ShapeResult result = shape.scaleShape(factors)) {
                     requireValid(result, "scale");
                     ShapeRefC scaled = result.get();
@@ -124,10 +130,13 @@ public final class ShapeFactory implements AutoCloseable {
             double depth = max.getZ() - min.getZ();
             if (!(width > 0.0) || !(height > 0.0) || !(depth > 0.0))
                 throw new IllegalArgumentException("Collider must have volume on every axis");
-            return new Vec3(
-                    Math.max(requested.x(), MIN_THICKNESS / width),
-                    Math.max(requested.y(), MIN_THICKNESS / height),
-                    Math.max(requested.z(), MIN_THICKNESS / depth));
+            if (width * requested.x() < MIN_THICKNESS
+                    || height * requested.y() < MIN_THICKNESS
+                    || depth * requested.z() < MIN_THICKNESS) {
+                throw new IllegalArgumentException("Scaled collider thickness is below the supported minimum "
+                        + MIN_THICKNESS);
+            }
+            return requested;
         }
     }
 
@@ -142,9 +151,11 @@ public final class ShapeFactory implements AutoCloseable {
                 yield new BoxShape(new com.github.stephengold.joltjni.Vec3(hx, hy, hz), radius);
             }
             case PhysicsShape.Sphere sphere -> new SphereShape(positiveFloat(sphere.radius(), "sphere radius"));
-            case PhysicsShape.Capsule capsule -> new CapsuleShape(
-                    JoltScene.nativeFloat(capsule.cylindricalHeight() * 0.5, "capsule half-height"),
-                    positiveFloat(capsule.radius(), "capsule radius"));
+            case PhysicsShape.Capsule capsule -> capsule.cylindricalHeight() == 0.0
+                    ? new SphereShape(positiveFloat(capsule.radius(), "capsule radius"))
+                    : new CapsuleShape(
+                            positiveFloat(capsule.cylindricalHeight() * 0.5, "capsule half-height"),
+                            positiveFloat(capsule.radius(), "capsule radius"));
             case PhysicsShape.Cylinder cylinder -> {
                 float halfHeight = positiveFloat(cylinder.height() * 0.5, "cylinder half-height");
                 float radius = positiveFloat(cylinder.radius(), "cylinder radius");
@@ -213,8 +224,52 @@ public final class ShapeFactory implements AutoCloseable {
 
     @Override
     public void close() {
-        cache.values().forEach(value -> value.shape().close());
+        Throwable firstFailure = null;
+        for (CacheEntry value : cache.values()) {
+            try {
+                value.shape.shape().close();
+            } catch (Throwable failure) {
+                if (firstFailure == null) firstFailure = failure;
+                else firstFailure.addSuppressed(failure);
+            }
+        }
         cache.clear();
+        if (firstFailure instanceof RuntimeException runtimeFailure) throw runtimeFailure;
+        if (firstFailure instanceof Error error) throw error;
+        if (firstFailure != null) throw new CompletionException(firstFailure);
+    }
+
+    private void release(ShapeKey key, CachedShape shape) {
+        CacheEntry entry = cache.get(key);
+        if (entry == null || entry.shape != shape) return;
+        if (--entry.references == 0) {
+            cache.remove(key);
+            shape.shape().close();
+        }
+    }
+
+    public static final class ShapeLease implements AutoCloseable {
+        private ShapeFactory owner;
+        private final ShapeKey key;
+        private final CachedShape shape;
+
+        private ShapeLease(ShapeFactory owner, ShapeKey key, CachedShape shape) {
+            this.owner = owner;
+            this.key = key;
+            this.shape = shape;
+        }
+
+        public CachedShape shape() {
+            return shape;
+        }
+
+        @Override
+        public void close() {
+            ShapeFactory current = owner;
+            if (current == null) return;
+            owner = null;
+            current.release(key, shape);
+        }
     }
 
     public record CachedShape(
@@ -248,5 +303,14 @@ public final class ShapeFactory implements AutoCloseable {
     }
 
     private record ShapeKey(PhysicsShape definition, Vec3 scale, Vec3 centreOfMassOffset) {
+    }
+
+    private static final class CacheEntry {
+        final CachedShape shape;
+        int references = 1;
+
+        CacheEntry(CachedShape shape) {
+            this.shape = shape;
+        }
     }
 }

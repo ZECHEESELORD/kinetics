@@ -3,11 +3,16 @@ package sh.harold.kinetics.plugin.physics;
 import com.github.stephengold.joltjni.*;
 import com.github.stephengold.joltjni.enumerate.ValidateResult;
 import com.github.stephengold.joltjni.readonly.ConstBody;
+import java.util.ArrayDeque;
+import java.util.HashMap;
+import java.util.Map;
 import sh.harold.kinetics.api.*;
+import sh.harold.kinetics.api.Vec3;
 
 final class SceneContactCollector extends CustomContactListener {
     private final JoltScene scene;
-    private final java.util.Map<PairKey, ContactMemory> activePairs = new java.util.HashMap<>();
+    private final Map<PairKey, ArrayDeque<Vec3>> validationPoints = new HashMap<>();
+    private final Map<PairKey, ContactMemory> activePairs = new HashMap<>();
 
     SceneContactCollector(JoltScene scene) {
         this.scene = scene;
@@ -29,6 +34,18 @@ final class SceneContactCollector extends CustomContactListener {
             if (body != null && (body.spec.collisionMask() & 1) == 0)
                 return ValidateResult.RejectAllContactsForThisBodyPair.ordinal();
         }
+
+        CollideShapeResult collision = new CollideShapeResult(collisionAddress);
+        com.github.stephengold.joltjni.Vec3 firstPoint = collision.getContactPointOn1();
+        com.github.stephengold.joltjni.Vec3 secondPoint = collision.getContactPointOn2();
+        Vec3 worldPoint = new Vec3(
+                x + midpoint(firstPoint.getX(), secondPoint.getX()) + scene.origin.x(),
+                y + midpoint(firstPoint.getY(), secondPoint.getY()) + scene.origin.y(),
+                z + midpoint(firstPoint.getZ(), secondPoint.getZ()) + scene.origin.z());
+        synchronized (validationPoints) {
+            validationPoints.computeIfAbsent(PairKey.of(first.getId(), second.getId()),
+                    ignored -> new ArrayDeque<>()).addLast(worldPoint);
+        }
         return ValidateResult.AcceptAllContactsForThisBodyPair.ordinal();
     }
 
@@ -39,35 +56,47 @@ final class SceneContactCollector extends CustomContactListener {
         ConstBody second = new Body(scene.system, secondAddress);
         ContactManifold manifold = new ContactManifold(manifoldAddress);
         com.github.stephengold.joltjni.Vec3 normal = manifold.getWorldSpaceNormal();
-        RVec3 point = manifold.getBaseOffset();
-        com.github.stephengold.joltjni.Vec3 av = first.getLinearVelocity();
-        com.github.stephengold.joltjni.Vec3 bv = second.getLinearVelocity();
-        configureContact(first, second, normal, av, bv, settingsAddress);
+        PairKey key = PairKey.of(first.getId(), second.getId());
+        Vec3 contactPoint;
+        synchronized (validationPoints) {
+            ArrayDeque<Vec3> points = validationPoints.get(key);
+            contactPoint = points == null ? null : points.pollFirst();
+            if (points != null && points.isEmpty()) validationPoints.remove(key);
+        }
+        if (contactPoint == null) {
+            synchronized (activePairs) {
+                ContactMemory previous = activePairs.get(key);
+                contactPoint = previous == null ? null : previous.point;
+            }
+        }
+        if (contactPoint == null) contactPoint = scene.world(manifold.getBaseOffset());
+        VelocityPair velocities = surfaceVelocities(first, second, contactPoint);
+        configureContact(first, second, normal, velocities.first, velocities.second, settingsAddress);
         scene.recordContact();
-        boolean wantsBegin = scene.wantsContact(ContactPhase.BEGIN);
-        boolean wantsImpact = scene.wantsContact(ContactPhase.IMPACT);
-        boolean wantsEnd = scene.wantsContact(ContactPhase.END);
-        if (!wantsBegin && !wantsImpact && !wantsEnd) return;
-        double relative = Math.abs((bv.getX() - av.getX()) * normal.getX()
-                + (bv.getY() - av.getY()) * normal.getY()
-                + (bv.getZ() - av.getZ()) * normal.getZ());
-        sh.harold.kinetics.api.Vec3 contactPoint = scene.world(point);
-        sh.harold.kinetics.api.Vec3 contactNormal = JoltScene.apiVec(normal);
-        PairKey key = PairKey.of(first.getUserData(), second.getUserData());
+        Vec3 contactNormal = JoltScene.apiVec(normal);
+        ContactMemory memory;
         boolean firstContact;
         synchronized (activePairs) {
             ContactMemory previous = activePairs.get(key);
             firstContact = previous == null;
-            activePairs.put(key, new ContactMemory(firstContact ? 1 : previous.count + 1,
-                    contactPoint, contactNormal));
+            memory = previous == null
+                    ? new ContactMemory(1, collider(first.getUserData()), collider(second.getUserData()),
+                            contactPoint, contactNormal)
+                    : new ContactMemory(previous.count + 1, previous.first, previous.second,
+                            contactPoint, contactNormal);
+            activePairs.put(key, memory);
         }
+        boolean wantsBegin = scene.wantsContact(ContactPhase.BEGIN);
+        boolean wantsImpact = scene.wantsContact(ContactPhase.IMPACT);
+        if (!wantsBegin && !wantsImpact) return;
+
+        double relative = closingSpeed(velocities, normal);
         if (wantsBegin && firstContact)
-            scene.dispatchContact(event(ContactPhase.BEGIN, first.getUserData(), second.getUserData(),
+            scene.dispatchContact(event(ContactPhase.BEGIN, memory.first, memory.second,
                     contactPoint, contactNormal, relative));
-        if (wantsImpact && relative >= .25) {
-            scene.dispatchContact(event(ContactPhase.IMPACT, first.getUserData(), second.getUserData(),
+        if (wantsImpact && relative >= .25)
+            scene.dispatchContact(event(ContactPhase.IMPACT, memory.first, memory.second,
                     contactPoint, contactNormal, relative));
-        }
     }
 
     @Override
@@ -76,41 +105,48 @@ final class SceneContactCollector extends CustomContactListener {
         ConstBody first = new Body(scene.system, firstAddress);
         ConstBody second = new Body(scene.system, secondAddress);
         ContactManifold manifold = new ContactManifold(manifoldAddress);
+        PairKey key = PairKey.of(first.getId(), second.getId());
+        Vec3 point;
+        synchronized (activePairs) {
+            ContactMemory memory = activePairs.get(key);
+            point = memory == null ? null : memory.point;
+        }
+        if (point == null) point = scene.world(manifold.getBaseOffset());
+        VelocityPair velocities = surfaceVelocities(first, second, point);
         configureContact(first, second, manifold.getWorldSpaceNormal(),
-                first.getLinearVelocity(), second.getLinearVelocity(), settingsAddress);
+                velocities.first, velocities.second, settingsAddress);
         scene.recordContact();
     }
 
     @Override
     public void onContactRemoved(long pairAddress) {
         SubShapeIdPair pair = new SubShapeIdPair(pairAddress);
-        JoltBody first = scene.byJoltId.get(pair.getBody1Id());
-        JoltBody second = scene.byJoltId.get(pair.getBody2Id());
-        long firstId = first == null ? 0 : first.id.value();
-        long secondId = second == null ? 0 : second.id.value();
-        PairKey key = PairKey.of(firstId, secondId);
+        PairKey key = PairKey.of(pair.getBody1Id(), pair.getBody2Id());
+        synchronized (validationPoints) {
+            validationPoints.remove(key);
+        }
         ContactMemory memory;
         synchronized (activePairs) {
             memory = activePairs.get(key);
             if (memory == null) return;
             if (memory.count > 1) {
-                activePairs.put(key, new ContactMemory(memory.count - 1, memory.point, memory.normal));
+                activePairs.put(key, new ContactMemory(memory.count - 1, memory.first, memory.second,
+                        memory.point, memory.normal));
                 return;
             }
             activePairs.remove(key);
         }
         if (scene.wantsContact(ContactPhase.END))
-            scene.dispatchContact(event(ContactPhase.END, firstId, secondId,
+            scene.dispatchContact(event(ContactPhase.END, memory.first, memory.second,
                     memory.point, memory.normal, 0));
     }
 
     private void configureContact(ConstBody first, ConstBody second,
-            com.github.stephengold.joltjni.Vec3 normal,
-            com.github.stephengold.joltjni.Vec3 firstVelocity,
-            com.github.stephengold.joltjni.Vec3 secondVelocity, long settingsAddress) {
-        double dx = secondVelocity.getX() - firstVelocity.getX();
-        double dy = secondVelocity.getY() - firstVelocity.getY();
-        double dz = secondVelocity.getZ() - firstVelocity.getZ();
+            com.github.stephengold.joltjni.Vec3 normal, Vec3 firstVelocity,
+            Vec3 secondVelocity, long settingsAddress) {
+        double dx = secondVelocity.x() - firstVelocity.x();
+        double dy = secondVelocity.y() - firstVelocity.y();
+        double dz = secondVelocity.z() - firstVelocity.z();
         double normalSpeed = dx * normal.getX() + dy * normal.getY() + dz * normal.getZ();
         double tx = dx - normalSpeed * normal.getX();
         double ty = dy - normalSpeed * normal.getY();
@@ -128,14 +164,39 @@ final class SceneContactCollector extends CustomContactListener {
         settings.setCombinedRestitution((float) Math.sqrt(firstRestitution * secondRestitution));
     }
 
+    private VelocityPair surfaceVelocities(ConstBody first, ConstBody second, Vec3 point) {
+        return new VelocityPair(surfaceVelocity(first, point), surfaceVelocity(second, point));
+    }
+
+    private Vec3 surfaceVelocity(ConstBody body, Vec3 point) {
+        com.github.stephengold.joltjni.Vec3 linear = body.getLinearVelocity();
+        com.github.stephengold.joltjni.Vec3 angular = body.getAngularVelocity();
+        RVec3 centre = body.getCenterOfMassPosition();
+        double rx = point.x() - scene.origin.x() - centre.xx();
+        double ry = point.y() - scene.origin.y() - centre.yy();
+        double rz = point.z() - scene.origin.z() - centre.zz();
+        return new Vec3(
+                linear.getX() + angular.getY() * rz - angular.getZ() * ry,
+                linear.getY() + angular.getZ() * rx - angular.getX() * rz,
+                linear.getZ() + angular.getX() * ry - angular.getY() * rx);
+    }
+
+    private static double closingSpeed(VelocityPair velocities,
+            com.github.stephengold.joltjni.Vec3 normal) {
+        double relative = (velocities.second.x() - velocities.first.x()) * normal.getX()
+                + (velocities.second.y() - velocities.first.y()) * normal.getY()
+                + (velocities.second.z() - velocities.first.z()) * normal.getZ();
+        return Math.max(0.0, -relative);
+    }
+
     private static double coefficient(JoltBody body, boolean staticContact) {
         if (body == null) return 0.7;
         return staticContact ? body.material.staticFriction() : body.material.dynamicFriction();
     }
 
-    private ContactEvent event(ContactPhase phase, long first, long second,
-            sh.harold.kinetics.api.Vec3 point, sh.harold.kinetics.api.Vec3 normal, double speed) {
-        return new ContactEvent(phase, collider(first), collider(second), point, normal, 0, speed);
+    private static ContactEvent event(ContactPhase phase, ColliderRef first, ColliderRef second,
+            Vec3 point, Vec3 normal, double speed) {
+        return new ContactEvent(phase, first, second, point, normal, 0, speed);
     }
 
     private ColliderRef collider(long id) {
@@ -143,13 +204,21 @@ final class SceneContactCollector extends CustomContactListener {
         return body == null ? ColliderRef.Terrain.INSTANCE : new ColliderRef.Body(body.id);
     }
 
-    private record PairKey(long first, long second) {
-        static PairKey of(long first, long second) {
-            return first <= second ? new PairKey(first, second) : new PairKey(second, first);
+    private static double midpoint(double first, double second) {
+        return first * 0.5 + second * 0.5;
+    }
+
+    private record PairKey(int first, int second) {
+        static PairKey of(int first, int second) {
+            return Integer.compareUnsigned(first, second) <= 0
+                    ? new PairKey(first, second) : new PairKey(second, first);
         }
     }
 
-    private record ContactMemory(int count, sh.harold.kinetics.api.Vec3 point,
-            sh.harold.kinetics.api.Vec3 normal) {
+    private record VelocityPair(Vec3 first, Vec3 second) {
+    }
+
+    private record ContactMemory(int count, ColliderRef first, ColliderRef second,
+            Vec3 point, Vec3 normal) {
     }
 }

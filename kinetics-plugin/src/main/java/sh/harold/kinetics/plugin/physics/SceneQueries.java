@@ -7,16 +7,50 @@ import sh.harold.kinetics.api.*;
 
 final class SceneQueries implements AutoCloseable {
     private final JoltScene scene;
-    private final BroadPhaseLayerFilter broadphase = new BroadPhaseLayerFilter();
-    private final ObjectLayerFilter objects = new ObjectLayerFilter();
-    private final BodyFilter bodyFilter = new BodyFilter();
-    private final CollideShapeSettings collideSettings = new CollideShapeSettings();
-    private final AnyHitCollideShapeCollector overlap = new AnyHitCollideShapeCollector();
-    private final RayCastSettings raySettings = new RayCastSettings();
-    private final AllHitCastRayCollector rayHits = new AllHitCastRayCollector();
+    private final BroadPhaseLayerFilter broadphase;
+    private final ObjectLayerFilter objects;
+    private final BodyFilter bodyFilter;
+    private final CollideShapeSettings collideSettings;
+    private final AnyHitCollideShapeCollector overlap;
+    private final RayCastSettings raySettings;
+    private final AllHitCastRayCollector rayHits;
 
     SceneQueries(JoltScene scene) {
         this.scene = scene;
+        BroadPhaseLayerFilter createdBroadphase = null;
+        ObjectLayerFilter createdObjects = null;
+        BodyFilter createdBodyFilter = null;
+        CollideShapeSettings createdCollideSettings = null;
+        AnyHitCollideShapeCollector createdOverlap = null;
+        RayCastSettings createdRaySettings = null;
+        AllHitCastRayCollector createdRayHits = null;
+        try {
+            createdBroadphase = new BroadPhaseLayerFilter();
+            createdObjects = new ObjectLayerFilter();
+            createdBodyFilter = new BodyFilter();
+            createdCollideSettings = new CollideShapeSettings();
+            createdOverlap = new AnyHitCollideShapeCollector();
+            createdRaySettings = new RayCastSettings();
+            createdRayHits = new AllHitCastRayCollector();
+        } catch (Throwable failure) {
+            failure = close(failure, createdRayHits);
+            failure = close(failure, createdRaySettings);
+            failure = close(failure, createdOverlap);
+            failure = close(failure, createdCollideSettings);
+            failure = close(failure, createdBodyFilter);
+            failure = close(failure, createdObjects);
+            failure = close(failure, createdBroadphase);
+            if (failure instanceof RuntimeException runtimeFailure) throw runtimeFailure;
+            if (failure instanceof Error error) throw error;
+            throw new CompletionException(failure);
+        }
+        broadphase = createdBroadphase;
+        objects = createdObjects;
+        bodyFilter = createdBodyFilter;
+        collideSettings = createdCollideSettings;
+        overlap = createdOverlap;
+        raySettings = createdRaySettings;
+        rayHits = createdRayHits;
     }
 
     CompletionStage<Optional<RaycastHit>> cast(RaycastQuery query) {
@@ -27,10 +61,9 @@ final class SceneQueries implements AutoCloseable {
             } catch (Throwable failure) {
                 scene.complete(future, null, failure);
             }
-        });
+        }, future);
         return future;
     }
-
     boolean overlaps(ShapeFactory.CachedShape shape, Pose pose, int ignoredJoltId) {
         overlap.reset();
         sh.harold.kinetics.api.Vec3 centre = pose.position().add(rotate(pose.rotation(), shape.centreOfMass()));
@@ -85,14 +118,28 @@ final class SceneQueries implements AutoCloseable {
                 vector.z() + rotation.w() * tz + rotation.x() * ty - rotation.y() * tx);
     }
 
+    private static Throwable close(Throwable first, AutoCloseable resource) {
+        if (resource == null) return first;
+        try {
+            resource.close();
+        } catch (Throwable failure) {
+            if (first == null) return failure;
+            first.addSuppressed(failure);
+        }
+        return first;
+    }
     @Override
     public void close() {
-        overlap.close();
-        rayHits.close();
-        raySettings.close();
-        collideSettings.close();
-        bodyFilter.close();
-        objects.close();
-        broadphase.close();
+        Throwable failure = null;
+        failure = close(failure, overlap);
+        failure = close(failure, rayHits);
+        failure = close(failure, raySettings);
+        failure = close(failure, collideSettings);
+        failure = close(failure, bodyFilter);
+        failure = close(failure, objects);
+        failure = close(failure, broadphase);
+        if (failure instanceof RuntimeException runtimeFailure) throw runtimeFailure;
+        if (failure instanceof Error error) throw error;
+        if (failure != null) throw new CompletionException(failure);
     }
 }
