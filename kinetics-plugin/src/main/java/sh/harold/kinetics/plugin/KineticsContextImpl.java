@@ -4,9 +4,11 @@ import java.util.Collection;
 import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import org.bukkit.plugin.java.JavaPlugin;
 import sh.harold.kinetics.api.KineticsContext;
@@ -21,6 +23,7 @@ final class KineticsContextImpl implements KineticsContext {
     private final CopyOnWriteArrayList<JoltScene> scenes = new CopyOnWriteArrayList<>();
     private final java.util.Set<String> reservedNames = ConcurrentHashMap.newKeySet();
     private final AtomicBoolean closed = new AtomicBoolean();
+    private final Object lifecycleLock = new Object();
 
     KineticsContextImpl(KineticsServiceImpl service, JavaPlugin owner) {
         this.service = Objects.requireNonNull(service, "service");
@@ -35,16 +38,20 @@ final class KineticsContextImpl implements KineticsContext {
     @Override
     public CompletionStage<PhysicsScene> createScene(SceneSpec spec) {
         Objects.requireNonNull(spec, "spec");
-        pruneClosedScenes();
-        if (closed.get()) {
-            return CompletableFuture.failedFuture(new IllegalStateException("Kinetics context is closed"));
-        }
-        if (!owner.isEnabled()) {
-            return CompletableFuture.failedFuture(new IllegalStateException("Owning plugin is disabled"));
-        }
-        if (!reservedNames.add(spec.name())) {
-            return CompletableFuture.failedFuture(
-                    new IllegalArgumentException("Scene name already exists for this owner: " + spec.name()));
+        synchronized (lifecycleLock) {
+            pruneClosedScenesLocked();
+            if (closed.get()) {
+                return CompletableFuture.failedFuture(
+                        new IllegalStateException("Kinetics context is closed"));
+            }
+            if (!owner.isEnabled()) {
+                return CompletableFuture.failedFuture(
+                        new IllegalStateException("Owning plugin is disabled"));
+            }
+            if (!reservedNames.add(spec.name())) {
+                return CompletableFuture.failedFuture(new IllegalArgumentException(
+                        "Scene name already exists for this owner: " + spec.name()));
+            }
         }
 
         CompletableFuture<PhysicsScene> result = new CompletableFuture<>();
@@ -53,79 +60,129 @@ final class KineticsContextImpl implements KineticsContext {
     }
 
     private void createSceneOnMain(SceneSpec spec, CompletableFuture<PhysicsScene> result) {
-        if (closed.get() || !owner.isEnabled()) {
-            reservedNames.remove(spec.name());
-            result.completeExceptionally(new IllegalStateException("Owning plugin is disabled"));
-            return;
+        synchronized (lifecycleLock) {
+            if (closed.get() || !owner.isEnabled()) {
+                reservedNames.remove(spec.name());
+                result.completeExceptionally(unavailableFailure());
+                return;
+            }
         }
 
         final SceneBridge bridge;
         try {
             bridge = service.bridgeFactory().create(spec);
         } catch (Throwable failure) {
-            reservedNames.remove(spec.name());
+            releaseName(spec.name());
             result.completeExceptionally(failure);
             return;
         }
 
-        service.coordinator().submit(() -> new JoltScene(spec, service.runtime(), bridge,
-                        service::executeOnMain, service.coordinator().stepRequester(),
-                        service.coordinator()::reportFailure))
+        service.coordinator().submit(() -> constructScene(spec, bridge))
                 .whenComplete((scene, constructionFailure) -> service.executeOnMain(() -> {
                     if (constructionFailure != null) {
-                        reservedNames.remove(spec.name());
-                        bridge.close();
-                        result.completeExceptionally(unwrap(constructionFailure));
-                        return;
-                    }
-                    if (closed.get() || !owner.isEnabled()) {
-                        bridge.close();
-                        service.coordinator().dispose(scene);
-                        reservedNames.remove(spec.name());
-                        result.completeExceptionally(new IllegalStateException("Owning plugin is disabled"));
+                        releaseName(spec.name());
+                        closeAfterConstructionFailure(bridge, unwrap(constructionFailure), result);
                         return;
                     }
 
-                    service.coordinator().add(scene);
-                    scenes.add(scene);
+                    boolean accepted;
+                    synchronized (lifecycleLock) {
+                        accepted = !closed.get() && owner.isEnabled();
+                        if (accepted) scenes.add(scene);
+                    }
+                    if (!accepted) {
+                        disposeRejectedScene(scene, unavailableFailure(), result);
+                        return;
+                    }
+
                     try {
                         service.bridgeFactory().prepare(scene).whenComplete((ignored, preparationFailure) ->
-                                service.executeOnMain(() -> finishPreparation(scene, result, preparationFailure)));
+                                service.executeOnMain(() ->
+                                        finishPreparation(scene, result, preparationFailure)));
                     } catch (Throwable failure) {
                         finishPreparation(scene, result, failure);
                     }
                 }));
     }
 
+    private JoltScene constructScene(SceneSpec spec, SceneBridge bridge) {
+        JoltScene scene = new JoltScene(spec, service.runtime(), bridge,
+                service::executeOnMain, service.coordinator().stepRequester(),
+                service.coordinator()::reportFailure);
+        service.coordinator().add(scene);
+        return scene;
+    }
+
     private void finishPreparation(JoltScene scene, CompletableFuture<PhysicsScene> result,
             Throwable preparationFailure) {
-        if (preparationFailure == null && !closed.get() && owner.isEnabled()) {
+        boolean accepted;
+        synchronized (lifecycleLock) {
+            accepted = preparationFailure == null && !closed.get() && owner.isEnabled()
+                    && scenes.contains(scene);
+            if (!accepted) {
+                scenes.remove(scene);
+                reservedNames.remove(scene.name());
+            }
+        }
+        if (accepted) {
             result.complete(scene);
             return;
         }
-        scenes.remove(scene);
-        reservedNames.remove(scene.name());
+
         scene.closeAsync();
         Throwable failure = preparationFailure == null
-                ? new IllegalStateException("Owning plugin was disabled while creating the scene")
+                ? unavailableFailure()
                 : unwrap(preparationFailure);
+        result.completeExceptionally(failure);
+    }
+
+    private void closeAfterConstructionFailure(SceneBridge bridge, Throwable failure,
+            CompletableFuture<PhysicsScene> result) {
+        try {
+            bridge.close();
+        } catch (Throwable cleanupFailure) {
+            if (cleanupFailure != failure) failure.addSuppressed(cleanupFailure);
+        }
+        result.completeExceptionally(failure);
+    }
+
+    private void disposeRejectedScene(JoltScene scene, Throwable failure,
+            CompletableFuture<PhysicsScene> result) {
+        releaseName(scene.name());
+        try {
+            service.coordinator().dispose(scene);
+        } catch (Throwable disposalFailure) {
+            if (disposalFailure != failure) failure.addSuppressed(disposalFailure);
+        }
         result.completeExceptionally(failure);
     }
 
     @Override
     public Collection<PhysicsScene> scenes() {
-        pruneClosedScenes();
-        return List.copyOf(scenes);
+        synchronized (lifecycleLock) {
+            pruneClosedScenesLocked();
+            return List.copyOf(scenes);
+        }
     }
 
-    private void pruneClosedScenes() {
+    private void pruneClosedScenesLocked() {
         scenes.removeIf(scene -> {
-            if (!scene.closed()) {
-                return false;
-            }
+            if (!scene.closed()) return false;
             reservedNames.remove(scene.name());
             return true;
         });
+    }
+
+    private void releaseName(String name) {
+        synchronized (lifecycleLock) {
+            reservedNames.remove(name);
+        }
+    }
+
+    private IllegalStateException unavailableFailure() {
+        return new IllegalStateException(closed.get()
+                ? "Kinetics context is closed"
+                : "Owning plugin is disabled");
     }
 
     @Override
@@ -135,19 +192,23 @@ final class KineticsContextImpl implements KineticsContext {
 
     @Override
     public void close() {
-        if (!closed.compareAndSet(false, true)) {
-            return;
+        List<JoltScene> closing;
+        synchronized (lifecycleLock) {
+            if (!closed.compareAndSet(false, true)) return;
+            closing = List.copyOf(scenes);
+            scenes.clear();
+            reservedNames.clear();
         }
-        for (JoltScene scene : scenes) {
-            scene.closeAsync();
-        }
-        scenes.clear();
-        reservedNames.clear();
+        for (JoltScene scene : closing) scene.closeAsync();
         service.release(owner, this);
     }
 
     private static Throwable unwrap(Throwable failure) {
-        return failure instanceof java.util.concurrent.CompletionException && failure.getCause() != null
-                ? failure.getCause() : failure;
+        Throwable current = failure;
+        while ((current instanceof CompletionException || current instanceof ExecutionException)
+                && current.getCause() != null && current.getCause() != current) {
+            current = current.getCause();
+        }
+        return current;
     }
 }

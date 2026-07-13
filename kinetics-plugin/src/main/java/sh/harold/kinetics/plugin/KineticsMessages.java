@@ -1,6 +1,8 @@
 package sh.harold.kinetics.plugin;
 
 import java.util.Locale;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.ExecutionException;
 import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.format.NamedTextColor;
 import sh.harold.kinetics.api.SceneStats;
@@ -30,7 +32,24 @@ final class KineticsMessages {
     }
 
     static Component failure(Throwable failure) {
-        return Component.text("Kinetics operation failed: " + failure.getMessage(), NamedTextColor.RED);
+        return Component.text(
+                "Kinetics operation failed: " + failureDetail(failure), NamedTextColor.RED);
+    }
+
+    static String failureDetail(Throwable failure) {
+        if (failure == null) return "unknown failure";
+        Throwable current = failure;
+        while (current.getCause() != null && current.getCause() != current
+                && (current instanceof CompletionException
+                        || current instanceof ExecutionException
+                        || current.getMessage() == null
+                        || current.getMessage().isBlank())) {
+            current = current.getCause();
+        }
+        String message = current.getMessage();
+        if (message != null && !message.isBlank()) return message.strip();
+        String type = current.getClass().getSimpleName();
+        return type.isBlank() ? "unknown failure" : type;
     }
 
     static Component sceneCount(int count) {

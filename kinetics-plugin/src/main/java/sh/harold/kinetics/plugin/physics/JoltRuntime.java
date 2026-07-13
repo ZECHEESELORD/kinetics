@@ -32,10 +32,11 @@ public final class JoltRuntime implements AutoCloseable {
             createdJobs = new JobSystemThreadPool(
                     Jolt.cMaxPhysicsJobs, Jolt.cMaxPhysicsBarriers, Math.max(1, workerThreads));
         } catch (Throwable failure) {
-            if (createdJobs != null) createdJobs.close();
-            if (createdAllocator != null) createdAllocator.close();
-            if (typesRegistered) Jolt.unregisterTypes();
-            Jolt.destroyFactory();
+            closeOwners(failure,
+                    createdJobs == null ? null : createdJobs::close,
+                    createdAllocator == null ? null : createdAllocator::close,
+                    typesRegistered ? Jolt::unregisterTypes : null,
+                    Jolt::destroyFactory);
             throw failure;
         }
         allocator = createdAllocator;
@@ -55,9 +56,39 @@ public final class JoltRuntime implements AutoCloseable {
         if (!closed.compareAndSet(false, true)) {
             return;
         }
-        jobs.close();
-        allocator.close();
-        Jolt.unregisterTypes();
-        Jolt.destroyFactory();
+        Throwable failure = closeOwners(null,
+                jobs::close,
+                allocator::close,
+                Jolt::unregisterTypes,
+                Jolt::destroyFactory);
+        if (failure != null) rethrow(failure);
+    }
+
+    static Throwable closeOwners(Throwable primary, OwnerClose... owners) {
+        Throwable failure = primary;
+        for (OwnerClose owner : owners) {
+            if (owner == null) continue;
+            try {
+                owner.close();
+            } catch (Throwable closeFailure) {
+                if (failure == null) {
+                    failure = closeFailure;
+                } else if (closeFailure != failure) {
+                    failure.addSuppressed(closeFailure);
+                }
+            }
+        }
+        return failure;
+    }
+
+    private static void rethrow(Throwable failure) {
+        if (failure instanceof RuntimeException runtimeFailure) throw runtimeFailure;
+        if (failure instanceof Error error) throw error;
+        throw new IllegalStateException("Jolt runtime cleanup failed", failure);
+    }
+
+    @FunctionalInterface
+    interface OwnerClose {
+        void close() throws Throwable;
     }
 }

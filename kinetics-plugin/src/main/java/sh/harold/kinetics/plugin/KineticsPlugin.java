@@ -9,6 +9,7 @@ import io.papermc.paper.command.brigadier.CommandSourceStack;
 import java.io.IOException;
 import java.util.Collection;
 import java.util.List;
+import java.util.concurrent.TimeUnit;
 import org.bukkit.command.CommandSender;
 import org.bukkit.entity.Player;
 import org.bukkit.plugin.java.JavaPlugin;
@@ -27,6 +28,7 @@ public final class KineticsPlugin extends JavaPlugin {
     private KineticsServiceImpl service;
     private BukkitTask tickTask;
     private PacketListenerCommon packetListener;
+    private boolean runtimeRetained;
     private final PaperDebugRenderer debugRenderer = new PaperDebugRenderer();
 
     @Override
@@ -36,7 +38,8 @@ public final class KineticsPlugin extends JavaPlugin {
             int workers = Math.max(1, Runtime.getRuntime().availableProcessors() - 2);
             runtime = new JoltRuntime(getDataFolder().toPath(), workers);
             coordinator = new PhysicsCoordinator(failure ->
-                    getLogger().severe("Physics coordinator failed: " + failure));
+                    getLogger().severe("Physics coordinator failed: "
+                            + KineticsMessages.failureDetail(failure)));
             bridgeFactory = createSceneBridgeFactory();
             service = new KineticsServiceImpl(this, runtime, coordinator, bridgeFactory);
             service.register();
@@ -48,7 +51,8 @@ public final class KineticsPlugin extends JavaPlugin {
             tickTask = getServer().getScheduler().runTaskTimer(this, service::tick, 1L, 1L);
             getLogger().info("Kinetics enabled with " + workers + " Jolt worker thread(s)");
         } catch (IOException | RuntimeException | LinkageError failure) {
-            getLogger().severe("Kinetics could not start: " + failure.getMessage());
+            getLogger().severe(
+                    "Kinetics could not start: " + KineticsMessages.failureDetail(failure));
             shutdown();
             getServer().getPluginManager().disablePlugin(this);
         }
@@ -81,31 +85,88 @@ public final class KineticsPlugin extends JavaPlugin {
                 var api = PacketEvents.getAPI();
                 if (api != null) api.getEventManager().unregisterListener(packetListener);
             } catch (RuntimeException | LinkageError failure) {
-                getLogger().warning("Could not unregister PacketEvents listener: " + failure.getMessage());
+                getLogger().warning("Could not unregister PacketEvents listener: "
+                        + KineticsMessages.failureDetail(failure));
             }
             packetListener = null;
         }
         if (tickTask != null) {
-            tickTask.cancel();
+            try {
+                tickTask.cancel();
+            } catch (RuntimeException failure) {
+                getLogger().warning(
+                        "Could not cancel the Kinetics tick task: "
+                                + KineticsMessages.failureDetail(failure));
+            }
             tickTask = null;
         }
+
         KineticsServiceImpl closingService = service;
-        if (closingService != null) closingService.close();
-        if (coordinator != null) {
-            coordinator.flush();
-            if (closingService != null) closingService.drainLateMainTasks();
-            coordinator.close();
-            if (closingService != null) closingService.drainLateMainTasks();
-            coordinator = null;
-        }
         service = null;
+        if (closingService != null) {
+            try {
+                closingService.close();
+            } catch (Throwable failure) {
+                getLogger().severe(
+                        "Could not close the Kinetics service: "
+                                + KineticsMessages.failureDetail(failure));
+            }
+        }
+
+        boolean coordinatorTerminated = coordinator == null;
+        PhysicsCoordinator closingCoordinator = coordinator;
+        coordinator = null;
+        if (closingCoordinator != null) {
+            if (!closingCoordinator.flush()) {
+                getLogger().warning("The physics command flush did not complete cleanly.");
+            }
+            drainLateMainTasks(closingService);
+            coordinatorTerminated = closingCoordinator.closeAndAwait(15, TimeUnit.SECONDS);
+            drainLateMainTasks(closingService);
+            if (!coordinatorTerminated) {
+                getLogger().severe(
+                        "THE PHYSICS COORDINATOR DID NOT TERMINATE CLEANLY. "
+                                + "Jolt native resources will be retained; restart the JVM before "
+                                + "attempting to enable Kinetics again.");
+            }
+        }
+
         if (bridgeFactory != null) {
-            bridgeFactory.close();
+            try {
+                bridgeFactory.close();
+            } catch (Throwable failure) {
+                getLogger().severe(
+                        "Could not close Paper scene resources: "
+                                + KineticsMessages.failureDetail(failure));
+            }
             bridgeFactory = null;
         }
-        if (runtime != null) {
-            runtime.close();
-            runtime = null;
+
+        if (runtime != null && !runtimeRetained) {
+            if (!coordinatorTerminated) {
+                runtimeRetained = true;
+            } else {
+                try {
+                    runtime.close();
+                } catch (Throwable failure) {
+                    getLogger().severe(
+                            "Jolt runtime cleanup failed: "
+                                    + KineticsMessages.failureDetail(failure));
+                } finally {
+                    runtime = null;
+                }
+            }
+        }
+    }
+
+    private void drainLateMainTasks(KineticsServiceImpl closingService) {
+        if (closingService == null) return;
+        try {
+            closingService.drainLateMainTasks();
+        } catch (Throwable failure) {
+            getLogger().severe(
+                    "Could not drain shutdown callbacks: "
+                            + KineticsMessages.failureDetail(failure));
         }
     }
 
