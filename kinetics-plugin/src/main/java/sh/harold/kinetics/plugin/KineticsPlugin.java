@@ -7,6 +7,7 @@ import com.github.retrooper.packetevents.util.PEVersion;
 import io.papermc.paper.command.brigadier.BasicCommand;
 import io.papermc.paper.command.brigadier.CommandSourceStack;
 import java.io.IOException;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
@@ -29,11 +30,15 @@ public final class KineticsPlugin extends JavaPlugin {
     private BukkitTask tickTask;
     private PacketListenerCommon packetListener;
     private boolean runtimeRetained;
+    private boolean demoEnabled;
+    private DemoLayer demoLayer;
     private final PaperDebugRenderer debugRenderer = new PaperDebugRenderer();
 
     @Override
     public void onEnable() {
         try {
+            saveDefaultConfig();
+            demoEnabled = getConfig().getBoolean("demo", false);
             requirePacketEvents();
             int workers = Math.max(1, Runtime.getRuntime().availableProcessors() - 2);
             runtime = new JoltRuntime(getDataFolder().toPath(), workers);
@@ -43,6 +48,7 @@ public final class KineticsPlugin extends JavaPlugin {
             bridgeFactory = createSceneBridgeFactory();
             service = new KineticsServiceImpl(this, runtime, coordinator, bridgeFactory);
             service.register();
+            if (demoEnabled) demoLayer = new DemoLayer(this, service);
             PaperEventRouter eventRouter = new PaperEventRouter(this, service::scenes);
             getServer().getPluginManager().registerEvents(eventRouter, this);
             packetListener = PacketEvents.getAPI().getEventManager()
@@ -80,6 +86,16 @@ public final class KineticsPlugin extends JavaPlugin {
     }
 
     private void shutdown() {
+        if (demoLayer != null) {
+            try {
+                demoLayer.close();
+            } catch (Throwable failure) {
+                getLogger().warning("Could not close the Kinetics demonstration: "
+                        + KineticsMessages.failureDetail(failure));
+            }
+            demoLayer = null;
+        }
+
         if (packetListener != null) {
             try {
                 var api = PacketEvents.getAPI();
@@ -174,15 +190,15 @@ public final class KineticsPlugin extends JavaPlugin {
         @Override
         public void execute(CommandSourceStack source, String[] args) {
             CommandSender sender = source.getSender();
-            if (args.length != 1) {
-                sender.sendMessage(KineticsMessages.usage());
+            if (args.length == 0) {
+                sender.sendMessage(KineticsMessages.usage(demoEnabled));
                 return;
             }
-            if (args[0].equalsIgnoreCase("stats")) {
+            if (args.length == 1 && args[0].equalsIgnoreCase("stats")) {
                 sendStats(sender);
                 return;
             }
-            if (args[0].equalsIgnoreCase("debug")) {
+            if (args.length == 1 && args[0].equalsIgnoreCase("debug")) {
                 if (!(sender instanceof Player player)) {
                     sender.sendMessage(KineticsMessages.playerOnly());
                     return;
@@ -193,12 +209,22 @@ public final class KineticsPlugin extends JavaPlugin {
                                 : KineticsMessages.failure(failure)));
                 return;
             }
-            sender.sendMessage(KineticsMessages.usage());
+            if (args[0].equalsIgnoreCase("demo")) {
+                executeDemo(sender, Arrays.copyOfRange(args, 1, args.length));
+                return;
+            }
+            sender.sendMessage(KineticsMessages.usage(demoEnabled));
         }
 
         @Override
         public Collection<String> suggest(CommandSourceStack source, String[] args) {
-            return args.length <= 1 ? List.of("stats", "debug") : List.of();
+            if (args.length <= 1) {
+                return demoEnabled ? List.of("stats", "debug", "demo") : List.of("stats", "debug");
+            }
+            if (demoEnabled && args[0].equalsIgnoreCase("demo") && args.length == 2) {
+                return List.of("sampler", "spectacle", "reset", "stop");
+            }
+            return List.of();
         }
 
         @Override
@@ -214,6 +240,32 @@ public final class KineticsPlugin extends JavaPlugin {
             sender.sendMessage(KineticsMessages.sceneCount(coordinator.scenes().size()));
             coordinator.scenes().forEach(scene ->
                     sender.sendMessage(KineticsMessages.stats(scene.name(), scene.stats())));
+        }
+
+        private void executeDemo(CommandSender sender, String[] args) {
+            if (!demoEnabled || demoLayer == null) {
+                sender.sendMessage(KineticsMessages.demoDisabled());
+                return;
+            }
+            if (!(sender instanceof Player player)) {
+                sender.sendMessage(KineticsMessages.demoPlayerOnly());
+                return;
+            }
+
+            final DemoCommandRequest request;
+            try {
+                request = DemoCommandRequest.parse(args);
+            } catch (IllegalArgumentException failure) {
+                sender.sendMessage(KineticsMessages.demoUsage());
+                return;
+            }
+
+            switch (request.action()) {
+                case SAMPLER, SPECTACLE ->
+                        demoLayer.start(player, request.action().mode(), request.coordinates());
+                case RESET -> demoLayer.reset(player);
+                case STOP -> demoLayer.stop(player);
+            }
         }
     }
 }

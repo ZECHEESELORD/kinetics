@@ -3,6 +3,7 @@ import java.util.zip.ZipFile
 plugins {
     java
     id("com.gradleup.shadow")
+    id("xyz.jpenilla.run-paper") version "3.0.2"
 }
 
 dependencies {
@@ -36,6 +37,13 @@ tasks.shadowJar {
     exclude("META-INF/*.SF", "META-INF/*.RSA", "META-INF/*.DSA")
 }
 
+tasks.runServer {
+    minecraftVersion("1.21.11")
+    downloadPlugins {
+        modrinth("packetevents", "h0ncTpUP") // PacketEvents 2.13.0 (Spigot)
+    }
+}
+
 tasks.assemble {
     dependsOn(tasks.shadowJar)
 }
@@ -50,6 +58,7 @@ val verifyShadowJar = tasks.register("verifyShadowJar") {
         }
         val required = setOf(
             "paper-plugin.yml",
+            "config.yml",
             "META-INF/LICENSE-JOLT-JNI.txt",
             "META-INF/LICENSE-JOLT-PHYSICS.txt",
             "sh/harold/kinetics/api/Vec3.class",

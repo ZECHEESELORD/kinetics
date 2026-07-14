@@ -12,8 +12,9 @@ final class KineticsMessages {
     private KineticsMessages() {
     }
 
-    static Component usage() {
-        return Component.text("Usage: /kinetics <stats|debug>", NamedTextColor.YELLOW);
+    static Component usage(boolean demoEnabled) {
+        String actions = demoEnabled ? "stats|debug|demo" : "stats|debug";
+        return Component.text("Usage: /kinetics <" + actions + ">", NamedTextColor.YELLOW);
     }
 
     static Component noScenes() {
@@ -22,6 +23,89 @@ final class KineticsMessages {
 
     static Component playerOnly() {
         return Component.text("Collider debugging requires a player.", NamedTextColor.RED);
+    }
+
+    static Component demoPlayerOnly() {
+        return Component.text("Kinetics demonstrations require a player world.", NamedTextColor.RED);
+    }
+
+    static Component demoDisabled() {
+        return Component.text("The Kinetics demonstration layer is disabled in config.yml.",
+                NamedTextColor.RED);
+    }
+
+    static Component demoUsage() {
+        return Component.text("Usage: /kinetics demo <sampler|spectacle> [x y z] | reset | stop",
+                NamedTextColor.YELLOW);
+    }
+
+    static Component demoStarting(String mode, String world, double x, double y, double z) {
+        return Component.text(String.format(Locale.ROOT,
+                "Preparing the %s demo in %s at %.1f, %.1f, %.1f...", mode, world, x, y, z),
+                NamedTextColor.AQUA);
+    }
+
+    static Component demoStarted(String mode) {
+        return Component.text("Kinetics " + mode + " demo is ready.", NamedTextColor.GREEN);
+    }
+
+    static Component demoStopped() {
+        return Component.text("Kinetics demonstration stopped.", NamedTextColor.GREEN);
+    }
+
+    static Component noDemo() {
+        return Component.text("Kinetics has no active demonstration.", NamedTextColor.GRAY);
+    }
+
+    static Component samplerGuide() {
+        return Component.text("Sampler controls: ", NamedTextColor.AQUA)
+                .append(Component.text("attack", NamedTextColor.YELLOW))
+                .append(Component.text(" = point impulse, ", NamedTextColor.GRAY))
+                .append(Component.text("right-click", NamedTextColor.YELLOW))
+                .append(Component.text(" = force burst, ", NamedTextColor.GRAY))
+                .append(Component.text("sneak-attack", NamedTextColor.YELLOW))
+                .append(Component.text(" = torque, ", NamedTextColor.GRAY))
+                .append(Component.text("sneak-right-click", NamedTextColor.YELLOW))
+                .append(Component.text(" = resize. Use /kinetics debug while looking at a body.",
+                        NamedTextColor.GRAY));
+    }
+
+    static Component resizeResult(boolean applied) {
+        return applied
+                ? Component.text("Resized the selected physics body.", NamedTextColor.GREEN)
+                : Component.text("That resize is blocked by another collider.", NamedTextColor.YELLOW);
+    }
+
+    static Component materialLabel() {
+        return label("MATERIAL RESPONSE");
+    }
+
+    static Component interactionLabel() {
+        return label("INFERRED BOX | SPHERE | CAPSULE\nIMPULSE | FORCE | TORQUE | RESIZE");
+    }
+
+    static Component motionLabel() {
+        return label("KINEMATIC MOTION");
+    }
+
+    static Component terrainLabel() {
+        return label("TERRAIN COLLISION");
+    }
+
+    static Component towerLabel() {
+        return label("252-BODY TOWER DEMOLITION");
+    }
+
+    static Component countdown(int number) {
+        return Component.text(Integer.toString(number), NamedTextColor.GOLD);
+    }
+
+    static Component launch() {
+        return Component.text("IMPACT", NamedTextColor.RED);
+    }
+
+    private static Component label(String text) {
+        return Component.text(text, NamedTextColor.AQUA);
     }
 
     static Component debugRendered(boolean rendered) {
