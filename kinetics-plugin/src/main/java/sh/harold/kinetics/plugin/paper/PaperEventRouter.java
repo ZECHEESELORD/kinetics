@@ -5,6 +5,7 @@ import com.github.retrooper.packetevents.event.PacketReceiveEvent;
 import com.github.retrooper.packetevents.protocol.packettype.PacketType;
 import com.github.retrooper.packetevents.protocol.player.InteractionHand;
 import com.github.retrooper.packetevents.wrapper.play.client.WrapperPlayClientAttack;
+import com.github.retrooper.packetevents.wrapper.play.client.WrapperPlayClientAnimation;
 import com.github.retrooper.packetevents.wrapper.play.client.WrapperPlayClientInteractEntity;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -168,6 +169,14 @@ public final class PaperEventRouter implements Listener, PacketListener {
 
     @Override
     public void onPacketReceive(PacketReceiveEvent event) {
+        if (event.getPacketType() == PacketType.Play.Client.ANIMATION) {
+            WrapperPlayClientAnimation packet = new WrapperPlayClientAnimation(event);
+            EquipmentSlot hand = packet.getHand() == InteractionHand.OFF_HAND
+                    ? EquipmentSlot.OFF_HAND : EquipmentSlot.HAND;
+            schedulePacketInteraction(event.getPlayer(), hand, InteractionAction.ATTACK);
+            return;
+        }
+
         int entityId;
         InteractionAction action;
         EquipmentSlot hand;
@@ -188,7 +197,12 @@ public final class PaperEventRouter implements Listener, PacketListener {
         if (!VirtualDisplayRenderer.ownsEntityId(entityId)) return;
 
         event.setCancelled(true);
-        Player player = event.getPlayer();
+        if (action == InteractionAction.ATTACK) return;
+        schedulePacketInteraction(event.getPlayer(), hand, action);
+    }
+
+    private void schedulePacketInteraction(Player player, EquipmentSlot hand,
+            InteractionAction action) {
         if (player == null || !plugin.isEnabled()) return;
         int inputTick = Bukkit.getCurrentTick();
         Bukkit.getScheduler().runTask(plugin,
@@ -222,8 +236,7 @@ public final class PaperEventRouter implements Listener, PacketListener {
         InputKey inputKey = new InputKey(player.getUniqueId(), hand, action);
         InputStamp previous = recentInput.get(inputKey);
         if (previous != null) {
-            int separation = Math.abs(previous.tick - inputTick);
-            if (separation <= 1 && (previous.sources & inputSource) == 0) {
+            if (previous.tick == inputTick && (previous.sources & inputSource) == 0) {
                 recentInput.put(inputKey, new InputStamp(
                         Math.max(previous.tick, inputTick), previous.sources | inputSource));
                 return;
