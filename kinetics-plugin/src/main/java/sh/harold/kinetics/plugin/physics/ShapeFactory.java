@@ -147,8 +147,7 @@ public final class ShapeFactory implements AutoCloseable {
                 float hx = positiveFloat(size.x() * 0.5, "box half-width");
                 float hy = positiveFloat(size.y() * 0.5, "box half-height");
                 float hz = positiveFloat(size.z() * 0.5, "box half-depth");
-                float radius = convexRadius(hx, hy, hz);
-                yield new BoxShape(new com.github.stephengold.joltjni.Vec3(hx, hy, hz), radius);
+                yield new BoxShape(new com.github.stephengold.joltjni.Vec3(hx, hy, hz), 0.0f);
             }
             case PhysicsShape.Sphere sphere -> new SphereShape(positiveFloat(sphere.radius(), "sphere radius"));
             case PhysicsShape.Capsule capsule -> capsule.cylindricalHeight() == 0.0
@@ -159,8 +158,7 @@ public final class ShapeFactory implements AutoCloseable {
             case PhysicsShape.Cylinder cylinder -> {
                 float halfHeight = positiveFloat(cylinder.height() * 0.5, "cylinder half-height");
                 float radius = positiveFloat(cylinder.radius(), "cylinder radius");
-                yield new CylinderShape(halfHeight, radius,
-                        convexRadius(halfHeight, radius, radius));
+                yield new CylinderShape(halfHeight, radius, 0.0f);
             }
             case PhysicsShape.ConvexHull hull -> buildHull(hull);
             case PhysicsShape.Compound compound -> buildCompound(compound);
@@ -172,7 +170,7 @@ public final class ShapeFactory implements AutoCloseable {
         for (Vec3 point : hull.points()) {
             points.add(jolt(point));
         }
-        try (ConvexHullShapeSettings settings = new ConvexHullShapeSettings(points, 0.005f);
+        try (ConvexHullShapeSettings settings = new ConvexHullShapeSettings(points, 0.0f);
                 ShapeResult result = settings.create()) {
             requireValid(result, "convex hull");
             return result.get();
@@ -193,10 +191,6 @@ public final class ShapeFactory implements AutoCloseable {
                 return result.get();
             }
         }
-    }
-
-    private static float convexRadius(float x, float y, float z) {
-        return Math.min(0.005f, Math.min(x, Math.min(y, z)) * 0.1f);
     }
 
     private static void requireValid(ShapeResult result, String operation) {

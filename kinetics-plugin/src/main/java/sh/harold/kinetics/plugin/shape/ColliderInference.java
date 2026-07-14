@@ -16,9 +16,66 @@ import sh.harold.kinetics.api.Vec3;
 
 /** Vanilla block and item collider inference without resource-pack inspection. */
 public final class ColliderInference {
-    public static final String ITEM_CATALOG_VERSION = "minecraft-1.21.11-v1";
+    public static final String ITEM_CATALOG_VERSION = "minecraft-1.21.11-v2";
     private static final double ITEM_DEPTH = 1.0 / 16.0;
     private static final PhysicsShape APPROXIMATE_ITEM = PhysicsShape.box(0.5, 0.5, ITEM_DEPTH);
+
+    /*
+     * Opaque pixels from Mojang's 1.21.11 client archive
+     * (SHA-1 ba2df812c2d12e0219c489c4cd9a5e1f0760f5bd). item/generated extrudes
+     * the texture from 7.5/16 through 8.5/16 on Z; FIXED uses unit scale.
+     */
+    private static final PhysicsShape ENDER_PEARL = generatedItem(
+            "................",
+            "................",
+            ".......###......",
+            ".....#######....",
+            "....#########...",
+            "...###########..",
+            "...###########..",
+            "..#############.",
+            "..#############.",
+            "..#############.",
+            "...###########..",
+            "...###########..",
+            "....#########...",
+            ".....#######....",
+            ".......###......",
+            "................");
+    private static final PhysicsShape SLIME_BALL = generatedItem(
+            "................",
+            "................",
+            "......####......",
+            "....########....",
+            "...##########...",
+            "...##########...",
+            "..############..",
+            "..############..",
+            "..############..",
+            "..############..",
+            "...##########...",
+            "...##########...",
+            "....########....",
+            "......####......",
+            "................",
+            "................");
+    private static final PhysicsShape BLAZE_ROD = generatedItem(
+            "................",
+            "............##..",
+            "...........####.",
+            "..........####..",
+            ".........####...",
+            "........####....",
+            ".......####.....",
+            "......####......",
+            ".....####.......",
+            "....####........",
+            "...####.........",
+            "..####..........",
+            ".####...........",
+            ".###............",
+            ".##.............",
+            "................");
 
     private static final PhysicsShape SWORD = compound(
             box(0.13, 0.52, 0.05, 0.0, 0.10),
@@ -92,6 +149,21 @@ public final class ColliderInference {
                 || item.getItemMeta().hasItemModel())) {
             return new InferredCollider(APPROXIMATE_ITEM, ColliderFidelity.APPROXIMATE);
         }
+        return inferVanillaItem(material);
+    }
+
+    /** Infers the base vanilla model without per-stack custom-model overrides. */
+    public static InferredCollider inferVanillaItem(Material material) {
+        Objects.requireNonNull(material, "material");
+        if (material == Material.ENDER_PEARL) {
+            return new InferredCollider(ENDER_PEARL, ColliderFidelity.EXACT);
+        }
+        if (material == Material.SLIME_BALL) {
+            return new InferredCollider(SLIME_BALL, ColliderFidelity.EXACT);
+        }
+        if (material == Material.BLAZE_ROD) {
+            return new InferredCollider(BLAZE_ROD, ColliderFidelity.EXACT);
+        }
         if (material.isAir()) {
             throw new IllegalArgumentException("Air has no item collider");
         }
@@ -149,6 +221,31 @@ public final class ColliderInference {
 
     private static PhysicsShape.Child box(double width, double height, double depth, double x, double y) {
         return new PhysicsShape.Child(PhysicsShape.box(width, height, depth), Pose.at(new Vec3(x, y, 0.0)));
+    }
+
+    private static PhysicsShape generatedItem(String... rows) {
+        if (rows.length != 16) {
+            throw new IllegalArgumentException("A generated item mask must contain 16 rows");
+        }
+        List<PhysicsShape.Child> children = new ArrayList<>();
+        for (int row = 0; row < rows.length; row++) {
+            String pixels = rows[row];
+            if (pixels.length() != 16 || pixels.chars().anyMatch(pixel -> pixel != '.' && pixel != '#')) {
+                throw new IllegalArgumentException("A generated item mask must be 16 pixels wide");
+            }
+            int column = 0;
+            while (column < pixels.length()) {
+                while (column < pixels.length() && pixels.charAt(column) == '.') column++;
+                int start = column;
+                while (column < pixels.length() && pixels.charAt(column) == '#') column++;
+                if (column == start) continue;
+                double width = (column - start) / 16.0;
+                double x = (start + column) / 32.0 - 0.5;
+                double y = 0.5 - (row + 0.5) / 16.0;
+                children.add(box(width, ITEM_DEPTH, ITEM_DEPTH, x, y));
+            }
+        }
+        return PhysicsShape.compound(children);
     }
 
     private static boolean containsAny(String value, String... fragments) {
