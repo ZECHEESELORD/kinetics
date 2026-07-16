@@ -6,7 +6,12 @@ This is still a work in progress. Expect the API to move around.
 
 ## Demonstrations
 
-<!-- add img -->
+<p align="center">
+  <img width="49%" alt="spinning-slimeball" src="https://github.com/user-attachments/assets/82bbd6e4-88d8-4690-a7f9-6c8951f613fd" />
+  <img width="49%" alt="impact" src="https://github.com/user-attachments/assets/d1e3191e-0f94-4e1d-bf37-fc69cffaeda4" />
+</p>
+
+
 
 ## Requirements
 
